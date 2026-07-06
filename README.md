@@ -1,1 +1,1 @@
-# SSL-Commerz-Payment-Method
+## SSL Commerz Payment Method
