@@ -32,8 +32,8 @@
 #### confirm password daw
 ![](https://imgur.com/QyGHDzk.png)
 
-#### 
-![](.png)
+#### information gulo check kore dekho thik ache kina. thik thakle click koro confirm registration
+![](https://imgur.com/jRFPHPh.png)
 
 #### 
 ![](.png)
