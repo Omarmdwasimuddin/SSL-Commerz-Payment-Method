@@ -42,5 +42,5 @@
 #### arekti email ashbe jekhane Store ID & Store Password deya thakbe.
 ![](https://imgur.com/ktcoHdu.png)
 
-#### Visit koro---> https://sandbox.sslcommerz.com/manage/ ---> 
+#### Visit koro---> https://sandbox.sslcommerz.com/manage/ ---> login koro
 ![](https://imgur.com/Ld9KNwF.png)
