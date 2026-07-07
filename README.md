@@ -44,3 +44,6 @@
 
 #### Visit koro---> https://sandbox.sslcommerz.com/manage/ ---> login koro
 ![](https://imgur.com/Ld9KNwF.png)
+
+#### login korar por dashboard e chole jabe
+![](https://imgur.com/idfG4xp.png)
