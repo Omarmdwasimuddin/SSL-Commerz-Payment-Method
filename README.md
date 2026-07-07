@@ -29,8 +29,8 @@
 #### password daw [ ei password e holo login password]
 ![](https://imgur.com/4nqfTR8.png)
 
-#### 
-![](.png)
+#### confirm password daw
+![](https://imgur.com/QyGHDzk.png)
 
 #### 
 ![](.png)
