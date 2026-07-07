@@ -43,5 +43,8 @@ value_d = ref004_D
 
 ---
 
-#### redirectGatewayURL Ctrl chepe click korle---> OTP page e niye jabe
+#### redirectGatewayURL Ctrl chepe click korle---> OTP page e niye jabe --->Success button click korle success url e niye jabe abar failed button e click korle fail url e niye jabe
 ![](https://imgur.com/ioio1r8.png)
+
+#### payment success hole---> ssl commerz er transections e record hobe.
+![](https://imgur.com/87j3lvC.png)
