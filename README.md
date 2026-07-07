@@ -8,14 +8,14 @@
 #### domain name daw---> real domain or localhost or vercel
 ![](https://imgur.com/LuajmpK.png)
 
-#### Company name daw
+#### Company name daw---> client er company name othoba project name daw.
 ![](https://imgur.com/zVjZggS.png)
 
 #### company address daw
 ![](https://imgur.com/HTbxDqf.png)
 
-#### 
-![](.png)
+#### developer name daw
+![](https://imgur.com/EEtfn82.png)
 
 #### 
 ![](.png)
