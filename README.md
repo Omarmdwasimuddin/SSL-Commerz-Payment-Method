@@ -38,3 +38,6 @@
 #### email theke verification code paste kore daw. and finally registration success message dibe.
 ![](https://imgur.com/Oqt4dfr.png)
 ![](https://imgur.com/XjBPw12.png)
+
+#### arekti email ashbe jekhane Store ID & Store Password deya thakbe.
+![](https://imgur.com/ktcoHdu.png)
