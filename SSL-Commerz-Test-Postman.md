@@ -40,3 +40,8 @@ value_d = ref004_D
 
 ![](https://imgur.com/sxRsiMA.png)
 ![](https://imgur.com/7YtUFzF.png)
+
+---
+
+#### redirectGatewayURL Ctrl chepe click korle---> OTP page e niye jabe
+![](https://imgur.com/ioio1r8.png)
