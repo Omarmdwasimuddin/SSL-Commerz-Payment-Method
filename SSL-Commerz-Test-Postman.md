@@ -36,3 +36,6 @@ value_c = ref003_C
 value_d = ref004_D
 ```
 ---
+
+![](https://imgur.com/sxRsiMA.png)
+![](https://imgur.com/7YtUFzF.png)
