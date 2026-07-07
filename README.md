@@ -35,5 +35,5 @@
 #### information gulo check kore dekho thik ache kina. thik thakle click koro confirm registration
 ![](https://imgur.com/jRFPHPh.png)
 
-#### 
-![](.png)
+#### email theke verification code paste kore daw. and finally registration success message dibe.
+![](https://imgur.com/Oqt4dfr.png)
