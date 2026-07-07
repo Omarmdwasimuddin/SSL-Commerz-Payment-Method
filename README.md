@@ -23,11 +23,11 @@
 #### number daw
 ![](https://imgur.com/hSSRBjF.png)
 
-#### 
-![](.png)
+#### username daw [ei user name e login ID hobe]
+![](https://imgur.com/e4Ho4yW.png)
 
-#### 
-![](.png)
+#### password daw [ ei password e holo login password]
+![](https://imgur.com/4nqfTR8.png)
 
 #### 
 ![](.png)
