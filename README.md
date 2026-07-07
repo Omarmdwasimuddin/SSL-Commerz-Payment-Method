@@ -6,7 +6,7 @@
 ![](https://imgur.com/6FwyBD1.png)
 
 #### domain name daw---> real domain or localhost or vercel
-![](https://imgur.com/45zHC3L.png)
+![](https://imgur.com/LuajmpK.png)
 
 #### Company name daw
 ![](https://imgur.com/zVjZggS.png)
