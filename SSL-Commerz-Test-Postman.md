@@ -12,6 +12,7 @@ tran_id = XYZ-123-SECRET
 success_url = http://localhost:3000/success
 fail_url = http://localhost:3000/fail
 cancel_url = http://localhost:3000/cancel
+ipn_url = http://localhost:3000/ipn
 cus_name = Wasim
 cus_email = mdwasimu015@gmail.com
 cus_add1 = Dhaka
