@@ -86,7 +86,7 @@ export async function POST(request: NextRequest) {
 
     /* 
         According to tran_id
-        Update your payment status = "success" in your database
+        Update your payment status = "Success" in your database
     */
 
     return NextResponse.redirect(new URL('/success', request.url), 303)
@@ -105,7 +105,7 @@ export async function POST(request: NextRequest) {
 
     /* 
         According to tran_id
-        Update your payment status = "cancel" in your database
+        Update your payment status = "Cancel" in your database
     */
 
     return NextResponse.redirect(new URL('/cancel', request.url), 303)
@@ -115,7 +115,20 @@ export async function POST(request: NextRequest) {
 
 #### app/api/fail
 ```bash
+import { NextRequest, NextResponse } from "next/server";
 
+
+export async function POST(request: NextRequest) {
+    let {searchParams} = new URL(request.url);
+    let tran_id = searchParams.get("tran_id");
+
+    /* 
+        According to tran_id
+        Update your payment status = "Fail" in your database
+    */
+
+    return NextResponse.redirect(new URL('/fail', request.url), 303)
+}
 ```
 ---
 
