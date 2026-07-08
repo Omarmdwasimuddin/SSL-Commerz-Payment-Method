@@ -96,17 +96,30 @@ export async function POST(request: NextRequest) {
 
 #### app/api/cancel
 ```bash
+import { NextRequest, NextResponse } from "next/server";
 
+
+export async function POST(request: NextRequest) {
+    let {searchParams} = new URL(request.url);
+    let tran_id = searchParams.get("tran_id");
+
+    /* 
+        According to tran_id
+        Update your payment status = "cancel" in your database
+    */
+
+    return NextResponse.redirect(new URL('/cancel', request.url), 303)
+}
 ```
 ---
 
-#### app/api/success
+#### app/api/fail
 ```bash
 
 ```
 ---
 
-#### app/api/success
+#### app/api/ipn
 ```bash
 
 ```
