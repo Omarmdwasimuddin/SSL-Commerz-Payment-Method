@@ -74,3 +74,27 @@ export async function POST(request: NextRequest) {
 }
 ```
 ---
+
+#### app/api/success
+```bash
+
+```
+---
+
+#### app/api/success
+```bash
+
+```
+---
+
+#### app/api/success
+```bash
+
+```
+---
+
+#### app/api/success
+```bash
+
+```
+---
