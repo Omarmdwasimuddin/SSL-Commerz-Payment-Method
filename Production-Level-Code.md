@@ -387,9 +387,11 @@ import { initPaymentSchema } from "@/lib/validations/payment.schema";
 import { generateTranId, initiatePayment } from "@/lib/services/sslcommerz.service";
 // import { auth } from "@/lib/auth";
 
+const SESSION_VALIDITY_MINUTES = 55; // SSLCommerz session ~1hr e expire hoy, tai buffer rekhe 55 min
+
 export async function POST(request: NextRequest) {
     try {
-        // 1. Auth check — apnar NextAuth.js v5 auth() diye replace korben
+        // 1. Auth check
         // const session = await auth();
         // if (!session?.user?.id) return NextResponse.json({ status: "error", message: "Unauthorized" }, { status: 401 });
         const userId = request.headers.get("x-debug-user-id");
@@ -406,37 +408,35 @@ export async function POST(request: NextRequest) {
         }
         const { orderId } = parsed.data;
 
-        // 3. Order DB theke fetch — client theke never trust
-        const order = await prisma.order.findUnique({ where: { id: orderId } });
+        // 3. Order + Product DB theke fetch (relation include kore)
+        const order = await prisma.order.findUnique({
+            where: { id: orderId },
+            include: { product: true },
+        });
         if (!order) return NextResponse.json({ status: "error", message: "Order not found" }, { status: 404 });
         if (order.userId !== userId) {
             log.warn("Order ownership mismatch", { orderId, userId });
             return NextResponse.json({ status: "error", message: "Forbidden" }, { status: 403 });
         }
-        if (order.status === "PAID") {
-            return NextResponse.json({ status: "error", message: "Already paid" }, { status: 409 });
+        if (order.status !== "PENDING") {
+            return NextResponse.json({ status: "error", message: `Order is already ${order.status.toLowerCase()}` }, { status: 409 });
         }
 
-        // 4. Duplicate protection — existing INITIATED session thakle reuse
+        // 4. Duplicate protection — recent (not expired) INITIATED session thakle reuse
+        const sessionCutoff = new Date(Date.now() - SESSION_VALIDITY_MINUTES * 60 * 1000);
         const existingTransaction = await prisma.transaction.findFirst({
-            where: { orderId: order.id, status: "INITIATED" },
+            where: { orderId: order.id, status: "INITIATED", createdAt: { gte: sessionCutoff } },
             orderBy: { createdAt: "desc" },
         });
         if (existingTransaction?.gatewayPageURL) {
             log.info("Reusing existing initiated transaction", { orderId, tranId: existingTransaction.tranId });
             return NextResponse.json({
                 status: "success",
-                data: { GatewayPageURL: existingTransaction.gatewayPageURL },
+                data: { GatewayPageURL: existingTransaction.gatewayPageURL, tranId: existingTransaction.tranId },
             });
         }
 
-        // 5. Customer info — production e User model theke ashbe
-        const customer = {
-            name: "Customer Name", email: "customer@example.com", address1: "N/A",
-            city: "Dhaka", postcode: "1000", country: "Bangladesh", phone: "01700000000",
-        };
-
-        // 6. Unique tran_id — DB collision check shoho
+        // 5. Unique tran_id
         let tranId = generateTranId();
         let attempt = 0;
         while (await prisma.transaction.findUnique({ where: { tranId } })) {
@@ -446,31 +446,38 @@ export async function POST(request: NextRequest) {
             tranId = generateTranId();
         }
 
-        // 7. SSLCommerz init call
+        // 6. SSLCommerz init call — Order-er customer info + product.name use kora hocche
         const sslResponse = await initiatePayment(
             {
-                tranId, amount: Number(order.amount), currency: order.currency,
-                productName: order.productName, productCategory: order.productCategory,
-                productProfile: order.productProfile,
+                tranId,
+                amount: Number(order.totalAmount),
+                currency: order.currency,
+                productName: order.product.name,
             },
-            customer
+            {
+                name: order.customerName,
+                email: order.customerEmail,
+                phone: order.customerPhone,
+                address: order.customerAddress ?? undefined,
+                city: order.customerCity ?? undefined,
+            }
         );
 
         if (sslResponse.status !== "SUCCESS" || !sslResponse.GatewayPageURL) {
             log.error("SSLCommerz init failed", { orderId, tranId, reason: sslResponse.failedreason });
             await prisma.transaction.create({
                 data: {
-                    tranId, orderId: order.id, amount: order.amount, currency: order.currency,
+                    tranId, orderId: order.id, amount: order.totalAmount, currency: order.currency,
                     status: "FAILED", rawInitResponse: sslResponse as object,
                 },
             });
             return NextResponse.json({ status: "error", message: sslResponse.failedreason || "Init failed" }, { status: 400 });
         }
 
-        // 8. Transaction save
+        // 7. Transaction save
         await prisma.transaction.create({
             data: {
-                tranId, orderId: order.id, amount: order.amount, currency: order.currency,
+                tranId, orderId: order.id, amount: order.totalAmount, currency: order.currency,
                 status: "INITIATED", sessionKey: sslResponse.sessionkey,
                 gatewayPageURL: sslResponse.GatewayPageURL, rawInitResponse: sslResponse as object,
             },
