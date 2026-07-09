@@ -152,9 +152,6 @@ model Transaction {
 }
 
 ```
-
-Command: `npx prisma migrate dev --name add_payment_module`
-
 ---
 
 #### .env
