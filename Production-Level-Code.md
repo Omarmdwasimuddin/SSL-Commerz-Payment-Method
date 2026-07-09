@@ -23,21 +23,87 @@ Simple version-er sathe key difference: `tran_id` ekhon Math.random() diye na, D
 
 ---
 
-#### prisma/schema.prisma (addition)
+#### prisma/schema.prisma
 ```bash
+generator client {
+  provider = "prisma-client-js"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum OrderStatus {
+  PENDING   // order created, waiting for payment
+  PAID      // payment verified (via Transaction)
+  FAILED    // SSLCommerz fail callback
+  CANCELLED // SSLCommerz cancel callback
+}
+
+enum TransactionStatus {
+  INITIATED // SSLCommerz session create hoise, ekhono pay hoyni
+  VALID     // Validation API confirm korse — final "paid" state
+  FAILED
+  CANCELLED
+  EXPIRED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  phone     String?
+  address   String?
+  city      String?
+
+  orders    Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  price       Decimal  @db.Decimal(10, 2)
+  imageUrl    String?
+  stock       Int      @default(100)
+
+  orders      Order[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("products")
+}
+
 model Order {
   id              String        @id @default(cuid())
+
   userId          String
-  // user            User          @relation(fields: [userId], references: [id])
-  // ↑ Apnar existing User model-er sathe uncomment kore relation lagiye din
+  user            User          @relation(fields: [userId], references: [id])
 
-  amount          Decimal       @db.Decimal(10, 2)
+  // Relation to product
+  productId       String
+  product         Product       @relation(fields: [productId], references: [id])
+
+  quantity        Int           @default(1)
+  totalAmount     Decimal       @db.Decimal(10, 2)
   currency        String        @default("BDT")
-  status          OrderStatus   @default(PENDING)
 
-  productName     String
-  productCategory String
-  productProfile  String        @default("general")
+  // Customer info snapshot — order er shomoy ja chilo, freeze kore rakha
+  // (User profile porey update hole o order history accurate thake)
+  customerName    String
+  customerEmail   String
+  customerPhone   String
+  customerAddress String?
+  customerCity    String?
+
+  status          OrderStatus   @default(PENDING)
 
   transactions    Transaction[]
 
@@ -46,6 +112,7 @@ model Order {
 
   @@index([userId])
   @@index([status])
+  @@map("orders")
 }
 
 model Transaction {
@@ -64,10 +131,11 @@ model Transaction {
 
   valId                  String?
   bankTranId             String?
-  cardType               String?
+  cardType               String?           // e.g. VISA, brac_visa, bkash ইত্যাদি
   cardIssuer             String?
   storeAmount            Decimal?          @db.Decimal(10, 2)
 
+  // Full raw payloads — audit trail o debugging er jonno
   rawInitResponse        Json?
   rawValidationResponse  Json?
   rawIpnPayload          Json?
@@ -80,22 +148,9 @@ model Transaction {
   @@index([orderId])
   @@index([status])
   @@index([valId])
+  @@map("transactions")
 }
 
-enum OrderStatus {
-  PENDING
-  PAID
-  FAILED
-  CANCELLED
-}
-
-enum TransactionStatus {
-  INITIATED   // Session create hoise, ekhono paid na
-  VALID       // Validation API confirm korse — final "paid" state
-  FAILED
-  CANCELLED
-  EXPIRED
-}
 ```
 
 Command: `npx prisma migrate dev --name add_payment_module`
