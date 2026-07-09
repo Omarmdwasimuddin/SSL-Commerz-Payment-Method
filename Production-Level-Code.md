@@ -188,17 +188,23 @@ const globalForPrisma = global as unknown as {
 
 #### lib/logger.ts
 ```bash
-type LogContext = Record<string, unknown>;
+import pino from "pino";
 
-function format(level: string, message: string, context?: LogContext) {
-    return JSON.stringify({ level, message, timestamp: new Date().toISOString(), ...context });
-}
+export const log = pino({
+    level: process.env.LOG_LEVEL || "info",
+    timestamp: pino.stdTimeFunctions.isoTime,
 
-export const log = {
-    info(message: string, context?: LogContext) { console.log(format("info", message, context)); },
-    warn(message: string, context?: LogContext) { console.warn(format("warn", message, context)); },
-    error(message: string, context?: LogContext) { console.error(format("error", message, context)); },
-};
+    transport:
+        process.env.NODE_ENV === "development"
+            ? {
+                  target: "pino-pretty",
+                  options: {
+                      colorize: true,
+                      translateTime: "SYS:standard",
+                  },
+              }
+            : undefined,
+});
 ```
 
 ---
