@@ -1,25 +1,25 @@
-## Complete Production-Ready SSLCommerz Payment Workflow
+## Complete Production-Ready SSLCommerz Payment Workflow 
 
 #### Architecture
 ```bash
 prisma/
-- schema.prisma          → Order + Transaction model
+- schema.prisma            → User + Product + Order + Transaction model
 
-src/lib/
-- prisma.ts               → Prisma client singleton
-- logger.ts                → Structured logger
-- validations/payment.schema.ts   → Zod validation
-- services/sslcommerz.service.ts  → SSLCommerz API calls (init + validation)
+lib/
+- prisma.ts                 → Prisma client singleton
+- logger.ts                  → Structured logger
+- validations/payment.schema.ts → Zod validation
+- services/sslcommerz.service.ts → SSLCommerz API calls (init + validation)
+- services/order.service.ts  → Shared transaction-finalize logic (success + ipn duitai use kore)
 
-src/app/api/payment/
-- init/route.ts            → Payment session start
-- success/route.ts         → Success callback (server-verified)
-- fail/route.ts            → Fail callback
-- cancel/route.ts          → Cancel callback
-- ipn/route.ts             → IPN (background, most reliable)
+app/api/
+- orders/route.ts             → Order create (checkout)
+- payment/init/route.ts       → Payment session start (existing orderId diye)
+- payment/success/route.ts    → Success callback (server-verified)
+- payment/fail/route.ts       → Fail callback
+- payment/cancel/route.ts     → Cancel callback
+- payment/ipn/route.ts        → IPN (background, most reliable)
 ```
-
-Simple version-er sathe key difference: `tran_id` ekhon Math.random() diye na, DB-e unique-check kore generate hoy; customer/product data hardcoded na, DB theke ashe; ar sob theke important — success/IPN-e SSLCommerz-er **Validation API** hit kore confirm kora hoy je payment ta genuine, shudhu redirect ashlei "paid" mark kora hoy na (eta spoof kora jay bole).
 
 ---
 
@@ -35,15 +35,15 @@ datasource db {
 }
 
 enum OrderStatus {
-  PENDING   // order created, waiting for payment
-  PAID      // payment verified (via Transaction)
-  FAILED    // SSLCommerz fail callback
-  CANCELLED // SSLCommerz cancel callback
+  PENDING
+  PAID
+  FAILED
+  CANCELLED
 }
 
 enum TransactionStatus {
-  INITIATED // SSLCommerz session create hoise, ekhono pay hoyni
-  VALID     // Validation API confirm korse — final "paid" state
+  INITIATED
+  VALID
   FAILED
   CANCELLED
   EXPIRED
@@ -87,7 +87,6 @@ model Order {
   userId          String
   user            User          @relation(fields: [userId], references: [id])
 
-  // Relation to product
   productId       String
   product         Product       @relation(fields: [productId], references: [id])
 
@@ -95,8 +94,6 @@ model Order {
   totalAmount     Decimal       @db.Decimal(10, 2)
   currency        String        @default("BDT")
 
-  // Customer info snapshot — order er shomoy ja chilo, freeze kore rakha
-  // (User profile porey update hole o order history accurate thake)
   customerName    String
   customerEmail   String
   customerPhone   String
@@ -117,7 +114,7 @@ model Order {
 
 model Transaction {
   id                     String            @id @default(cuid())
-  tranId                 String            @unique   // duplicate protection-er backbone
+  tranId                 String            @unique
 
   orderId                String
   order                  Order             @relation(fields: [orderId], references: [id])
@@ -131,16 +128,15 @@ model Transaction {
 
   valId                  String?
   bankTranId             String?
-  cardType               String?           // e.g. VISA, brac_visa, bkash ইত্যাদি
+  cardType               String?
   cardIssuer             String?
   storeAmount            Decimal?          @db.Decimal(10, 2)
 
-  // Full raw payloads — audit trail o debugging er jonno
   rawInitResponse        Json?
   rawValidationResponse  Json?
   rawIpnPayload          Json?
 
-  processedAt            DateTime?         // idempotency guard
+  processedAt            DateTime?
 
   createdAt              DateTime          @default(now())
   updatedAt              DateTime          @updatedAt
@@ -150,8 +146,8 @@ model Transaction {
   @@index([valId])
   @@map("transactions")
 }
-
 ```
+
 ---
 
 #### .env
@@ -168,7 +164,7 @@ APP_URL=http://localhost:3000
 
 ---
 
-#### src/lib/prisma.ts
+#### lib/prisma.ts
 ```bash
 import { PrismaClient } from "@/app/generated/prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -181,50 +177,49 @@ const globalForPrisma = global as unknown as {
     connectionString: process.env.DATABASE_URL,
  });
 
- const prisma = globalForPrisma.prisma || new PrismaClient({ adapter, });
+ const prisma = globalForPrisma.prisma || new PrismaClient({ adapter, log: ['info', 'query', 'error', 'warn'] });
 
  if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 
  export default prisma;
-
 ```
 
 ---
 
-#### src/lib/logger.ts
+#### lib/logger.ts
 ```bash
 type LogContext = Record<string, unknown>;
 
 function format(level: string, message: string, context?: LogContext) {
-    return JSON.stringify({
-        level,
-        message,
-        timestamp: new Date().toISOString(),
-        ...context,
-    });
+    return JSON.stringify({ level, message, timestamp: new Date().toISOString(), ...context });
 }
 
 export const log = {
-    info(message: string, context?: LogContext) {
-        console.log(format("info", message, context));
-    },
-    warn(message: string, context?: LogContext) {
-        console.warn(format("warn", message, context));
-    },
-    error(message: string, context?: LogContext) {
-        console.error(format("error", message, context));
-    },
+    info(message: string, context?: LogContext) { console.log(format("info", message, context)); },
+    warn(message: string, context?: LogContext) { console.warn(format("warn", message, context)); },
+    error(message: string, context?: LogContext) { console.error(format("error", message, context)); },
 };
 ```
 
 ---
 
-#### src/lib/validations/payment.schema.ts
+#### lib/validations/payment.schema.ts
 ```bash
 import { z } from "zod";
 
-// Client theke shudhu orderId nei — customer/product data DB theke,
-// tampering thekay eta protect kore
+// Checkout — order create korar jonno. Price kokhono client theke nei na.
+export const createOrderSchema = z.object({
+    productId: z.string().min(1, "productId is required").cuid("Invalid productId"),
+    quantity: z.number().int().min(1, "Quantity must be at least 1").max(100, "Quantity too high"),
+    customerName: z.string().min(2, "Name is required"),
+    customerEmail: z.string().email("Invalid email"),
+    customerPhone: z.string().min(11, "Invalid phone number").max(15),
+    customerAddress: z.string().optional(),
+    customerCity: z.string().optional(),
+});
+export type CreateOrderInput = z.infer<typeof createOrderSchema>;
+
+// Payment session start — shudhu existing orderId nei
 export const initPaymentSchema = z.object({
     orderId: z.string().min(1, "orderId is required").cuid("Invalid orderId format"),
 });
@@ -250,7 +245,7 @@ export type IpnPayloadInput = z.infer<typeof ipnPayloadSchema>;
 
 ---
 
-#### src/lib/services/sslcommerz.service.ts
+#### lib/services/sslcommerz.service.ts
 ```bash
 import { log } from "@/lib/logger";
 
@@ -264,25 +259,33 @@ interface SSLCommerzInitResponse {
 
 interface SSLCommerzValidationResponse {
     status: "VALID" | "VALIDATED" | "INVALID_TRANSACTION" | "FAILED" | string;
-    tran_id?: string;
     val_id?: string;
     amount?: string;
     store_amount?: string;
+    currency_amount?: string;
     bank_tran_id?: string;
     card_type?: string;
     card_issuer?: string;
-    currency_amount?: string;
     [key: string]: unknown;
 }
 
+// FIXED: age address1/postcode/country chilo, kintu Order model-e shudhu
+// customerAddress ar customerCity ache — interface-ta match kore chotto kora hoise
 interface CustomerInfo {
-    name: string; email: string; address1: string;
-    city: string; postcode: string; country: string; phone: string;
+    name: string;
+    email: string;
+    phone: string;
+    address?: string;
+    city?: string;
 }
 
+// FIXED: productCategory/productProfile Order/Product kono model-e nai bole
+// bad kora hoise — function-er ভিতরে hardcode kora hocche
 interface OrderInfo {
-    tranId: string; amount: number; currency: string;
-    productName: string; productCategory: string; productProfile: string;
+    tranId: string;
+    amount: number;
+    currency: string;
+    productName: string;
 }
 
 function getEnvConfig() {
@@ -298,7 +301,6 @@ function getEnvConfig() {
     return { storeId, storePassword, apiBaseUrl, appUrl };
 }
 
-// Timestamp + random suffix — collision practically zero, tobuo DB unique constraint final safety net
 export function generateTranId(): string {
     const random = Math.random().toString(36).substring(2, 10).toUpperCase();
     return `TXN-${Date.now()}-${random}`;
@@ -321,17 +323,17 @@ export async function initiatePayment(order: OrderInfo, customer: CustomerInfo):
 
     formData.append("cus_name", customer.name);
     formData.append("cus_email", customer.email);
-    formData.append("cus_add1", customer.address1);
-    formData.append("cus_city", customer.city);
-    formData.append("cus_postcode", customer.postcode);
-    formData.append("cus_country", customer.country);
+    formData.append("cus_add1", customer.address || "N/A");
+    formData.append("cus_city", customer.city || "N/A");
+    formData.append("cus_postcode", "1000");
+    formData.append("cus_country", "Bangladesh");
     formData.append("cus_phone", customer.phone);
 
     formData.append("shipping_method", "NO");
     formData.append("num_of_item", "1");
     formData.append("product_name", order.productName);
-    formData.append("product_category", order.productCategory);
-    formData.append("product_profile", order.productProfile);
+    formData.append("product_category", "E-commerce");
+    formData.append("product_profile", "general");
 
     const response = await fetch(`${apiBaseUrl}/gwprocess/v4/api.php`, { method: "POST", body: formData });
 
@@ -347,14 +349,10 @@ export async function initiatePayment(order: OrderInfo, customer: CustomerInfo):
     return data;
 }
 
-// SSLCommerz Order Validation API — https://developer.sslcommerz.com/doc/v4/#validation
 export async function validateTransaction(valId: string): Promise<SSLCommerzValidationResponse> {
     const { storeId, storePassword, apiBaseUrl } = getEnvConfig();
 
-    const params = new URLSearchParams({
-        val_id: valId, store_id: storeId, store_passwd: storePassword, format: "json",
-    });
-
+    const params = new URLSearchParams({ val_id: valId, store_id: storeId, store_passwd: storePassword, format: "json" });
     const response = await fetch(`${apiBaseUrl}/validator/api/validationserverAPI.php?${params}`, { method: "GET" });
 
     if (!response.ok) {
@@ -364,7 +362,6 @@ export async function validateTransaction(valId: string): Promise<SSLCommerzVali
     return (await response.json()) as SSLCommerzValidationResponse;
 }
 
-// Amount mismatch dhorbe — attacker kom pay kore beshi amount er order "valid" dekhate parbe na
 export function isValidationAmountMatching(validation: SSLCommerzValidationResponse, expectedAmount: number): boolean {
     const receivedAmount = parseFloat(validation.currency_amount ?? validation.amount ?? "0");
     return Math.abs(receivedAmount - expectedAmount) < 0.01;
@@ -372,6 +369,184 @@ export function isValidationAmountMatching(validation: SSLCommerzValidationRespo
 
 export function isValidationStatusSuccess(validation: SSLCommerzValidationResponse): boolean {
     return validation.status === "VALID" || validation.status === "VALIDATED";
+}
+```
+
+---
+
+#### lib/services/order.service.ts
+```bash
+import { prisma } from "@/lib/prisma";
+import { log } from "@/lib/logger";
+import { validateTransaction, isValidationStatusSuccess, isValidationAmountMatching } from "@/lib/services/sslcommerz.service";
+
+/**
+ * success/route.ts ar ipn/route.ts duitai ei ekই verification logic follow kore,
+ * tai ekhane ekbar likhe dutai reuse kora hocche.
+ */
+export type FinalizeOutcome =
+    | { outcome: "not_found" }
+    | { outcome: "already_processed"; orderId: string }
+    | { outcome: "missing_val_id"; orderId: string }
+    | { outcome: "validation_failed"; orderId: string }
+    | { outcome: "amount_mismatch"; orderId: string }
+    | { outcome: "success"; orderId: string };
+
+export async function finalizeTransactionPayment(tranId: string, valId: string | undefined): Promise<FinalizeOutcome> {
+    const transaction = await prisma.transaction.findUnique({ where: { tranId } });
+
+    if (!transaction) {
+        log.error("Callback for unknown tranId", { tranId });
+        return { outcome: "not_found" };
+    }
+
+    // Idempotency — ei transaction already process hoye gele (success + IPN duitai
+    // kache-kache ashte pare) revalidate na kore shorashori result ferot dei
+    if (transaction.processedAt) {
+        log.info("Transaction already processed, skipping re-verification", { tranId });
+        return { outcome: "already_processed", orderId: transaction.orderId };
+    }
+
+    if (!valId) {
+        log.warn("Callback missing val_id", { tranId });
+        return { outcome: "missing_val_id", orderId: transaction.orderId };
+    }
+
+    const validation = await validateTransaction(valId);
+
+    if (!isValidationStatusSuccess(validation)) {
+        log.warn("Validation API returned non-success status", { tranId, validation });
+        await prisma.transaction.update({
+            where: { tranId },
+            data: { status: "FAILED", rawValidationResponse: validation as object, processedAt: new Date() },
+        });
+        // Note: Order status ekhane change kora hoy na — user chaile abar
+        // /api/payment/init call kore notun Transaction diye retry korte parbe
+        return { outcome: "validation_failed", orderId: transaction.orderId };
+    }
+
+    if (!isValidationAmountMatching(validation, Number(transaction.amount))) {
+        log.error("Validation amount mismatch — possible tampering", {
+            tranId, expected: transaction.amount, received: validation.currency_amount ?? validation.amount,
+        });
+        await prisma.transaction.update({
+            where: { tranId },
+            data: { status: "FAILED", rawValidationResponse: validation as object, processedAt: new Date() },
+        });
+        return { outcome: "amount_mismatch", orderId: transaction.orderId };
+    }
+
+    // Sob check pass — Transaction VALID, Order PAID (shudhu PENDING thakle),
+    // ar Product stock decrement — sob ekshathe atomic
+    const order = await prisma.order.findUnique({ where: { id: transaction.orderId } });
+    if (!order) {
+        log.error("Transaction points to a missing order", { tranId, orderId: transaction.orderId });
+        return { outcome: "not_found" };
+    }
+
+    const [, orderUpdateResult, stockUpdateResult] = await prisma.$transaction([
+        prisma.transaction.update({
+            where: { tranId },
+            data: {
+                status: "VALID",
+                valId: validation.val_id,
+                bankTranId: validation.bank_tran_id,
+                cardType: validation.card_type,
+                cardIssuer: validation.card_issuer,
+                storeAmount: validation.store_amount ? Number(validation.store_amount) : undefined,
+                rawValidationResponse: validation as object,
+                processedAt: new Date(),
+            },
+        }),
+        // Guard: shudhu ekhono PENDING thakle-i PAID e move hobe — double-processing thekay eta second layer of protection
+        prisma.order.updateMany({
+            where: { id: order.id, status: "PENDING" },
+            data: { status: "PAID" },
+        }),
+        // Guard: stock thakle-i decrement hobe, noyto oversell hobe na
+        prisma.product.updateMany({
+            where: { id: order.productId, stock: { gte: order.quantity } },
+            data: { stock: { decrement: order.quantity } },
+        }),
+    ]);
+
+    if (orderUpdateResult.count === 0) {
+        log.warn("Order was not in PENDING state during finalize — likely already paid via another transaction", {
+            orderId: order.id, tranId,
+        });
+    }
+    if (stockUpdateResult.count === 0) {
+        log.error("Stock decrement failed after payment — possible oversell, needs manual review", {
+            orderId: order.id, productId: order.productId,
+        });
+    }
+
+    log.info("Payment verified and order finalized", { tranId, orderId: order.id });
+    return { outcome: "success", orderId: order.id };
+}
+```
+
+---
+
+#### app/api/orders  (checkout — Order create)
+```bash
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { prisma } from "@/lib/prisma";
+import { log } from "@/lib/logger";
+import { createOrderSchema } from "@/lib/validations/payment.schema";
+// import { auth } from "@/lib/auth"; // Apnar NextAuth.js v5 setup theke import korben
+
+export async function POST(request: NextRequest) {
+    try {
+        // 1. Auth check
+        // const session = await auth();
+        // if (!session?.user?.id) return NextResponse.json({ status: "error", message: "Unauthorized" }, { status: 401 });
+        const userId = request.headers.get("x-debug-user-id");
+        if (!userId) return NextResponse.json({ status: "error", message: "Unauthorized" }, { status: 401 });
+
+        // 2. Body validation
+        const body = await request.json().catch(() => null);
+        const parsed = createOrderSchema.safeParse(body);
+        if (!parsed.success) {
+            return NextResponse.json(
+                { status: "error", message: "Invalid request body", errors: z.treeifyError(parsed.error) },
+                { status: 400 }
+            );
+        }
+        const { productId, quantity, customerName, customerEmail, customerPhone, customerAddress, customerCity } = parsed.data;
+
+        // 3. Product DB theke fetch — price client theke kokhono trust kora hoy na
+        const product = await prisma.product.findUnique({ where: { id: productId } });
+        if (!product) return NextResponse.json({ status: "error", message: "Product not found" }, { status: 404 });
+        if (product.stock < quantity) {
+            return NextResponse.json({ status: "error", message: "Insufficient stock" }, { status: 409 });
+        }
+
+        // 4. Server-side price calculation
+        const unitPrice = Number(product.price);
+        const totalAmount = Math.round(unitPrice * quantity * 100) / 100;
+
+        // 5. Order create — status PENDING, payment ekhono shuru hoyni
+        const order = await prisma.order.create({
+            data: {
+                userId, productId, quantity, totalAmount,
+                customerName, customerEmail, customerPhone, customerAddress, customerCity,
+                status: "PENDING",
+            },
+        });
+
+        log.info("Order created", { orderId: order.id, productId, userId });
+
+        return NextResponse.json({
+            status: "success",
+            message: "Order created successfully",
+            data: { orderId: order.id, totalAmount },
+        });
+    } catch (error) {
+        log.error("Order creation unexpected error", { error: error instanceof Error ? error.message : String(error) });
+        return NextResponse.json({ status: "error", message: "Something went wrong while creating order" }, { status: 500 });
+    }
 }
 ```
 
@@ -500,67 +675,38 @@ export async function POST(request: NextRequest) {
 #### app/api/payment/success
 ```bash
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
 import { log } from "@/lib/logger";
 import { sslCallbackSchema } from "@/lib/validations/payment.schema";
-import { validateTransaction, isValidationStatusSuccess, isValidationAmountMatching } from "@/lib/services/sslcommerz.service";
+import { finalizeTransactionPayment } from "@/lib/services/order.service";
 
-// Browser redirect spoof-able, tai shudhu ashlei "paid" dhora jabe na —
-// Validation API hit kore server-to-server confirm kora hocche
 export async function POST(request: NextRequest) {
     const appUrl = process.env.APP_URL ?? "";
     try {
         const formData = await request.formData();
         const rawPayload = Object.fromEntries(formData.entries());
         const parsed = sslCallbackSchema.safeParse(rawPayload);
+
         if (!parsed.success) {
             log.warn("Invalid success callback payload", { rawPayload });
             return NextResponse.redirect(`${appUrl}/payment/failed?reason=invalid_callback`);
         }
+
         const { tran_id, val_id } = parsed.data;
+        const result = await finalizeTransactionPayment(tran_id, val_id);
 
-        const transaction = await prisma.transaction.findUnique({ where: { tranId: tran_id }, include: { order: true } });
-        if (!transaction) {
-            log.error("Success callback for unknown tran_id", { tran_id });
-            return NextResponse.redirect(`${appUrl}/payment/failed?reason=unknown_transaction`);
+        switch (result.outcome) {
+            case "not_found":
+                return NextResponse.redirect(`${appUrl}/payment/failed?reason=unknown_transaction`);
+            case "already_processed":
+            case "success":
+                return NextResponse.redirect(`${appUrl}/payment/success?orderId=${result.orderId}`);
+            case "missing_val_id":
+                return NextResponse.redirect(`${appUrl}/payment/failed?reason=missing_val_id&orderId=${result.orderId}`);
+            case "validation_failed":
+                return NextResponse.redirect(`${appUrl}/payment/failed?reason=validation_failed&orderId=${result.orderId}`);
+            case "amount_mismatch":
+                return NextResponse.redirect(`${appUrl}/payment/failed?reason=amount_mismatch&orderId=${result.orderId}`);
         }
-
-        // Idempotency — already processed hole revalidate na kore direct success page
-        if (transaction.processedAt) {
-            return NextResponse.redirect(`${appUrl}/payment/success?orderId=${transaction.orderId}`);
-        }
-        if (!val_id) {
-            return NextResponse.redirect(`${appUrl}/payment/failed?reason=missing_val_id`);
-        }
-
-        const validation = await validateTransaction(val_id);
-
-        if (!isValidationStatusSuccess(validation)) {
-            await prisma.transaction.update({ where: { tranId: tran_id }, data: { status: "FAILED", rawValidationResponse: validation as object } });
-            return NextResponse.redirect(`${appUrl}/payment/failed?reason=validation_failed`);
-        }
-        if (!isValidationAmountMatching(validation, Number(transaction.amount))) {
-            log.error("Validation amount mismatch — possible tampering", { tran_id });
-            await prisma.transaction.update({ where: { tranId: tran_id }, data: { status: "FAILED", rawValidationResponse: validation as object } });
-            return NextResponse.redirect(`${appUrl}/payment/failed?reason=amount_mismatch`);
-        }
-
-        // Sob check pass — atomic transaction e order + transaction dutai update
-        await prisma.$transaction([
-            prisma.transaction.update({
-                where: { tranId: tran_id },
-                data: {
-                    status: "VALID", valId: validation.val_id, bankTranId: validation.bank_tran_id,
-                    cardType: validation.card_type, cardIssuer: validation.card_issuer,
-                    storeAmount: validation.store_amount ? Number(validation.store_amount) : undefined,
-                    rawValidationResponse: validation as object, processedAt: new Date(),
-                },
-            }),
-            prisma.order.update({ where: { id: transaction.orderId }, data: { status: "PAID" } }),
-        ]);
-
-        log.info("Payment verified, order paid", { tran_id, orderId: transaction.orderId });
-        return NextResponse.redirect(`${appUrl}/payment/success?orderId=${transaction.orderId}`);
     } catch (error) {
         log.error("Success callback unexpected error", { error: error instanceof Error ? error.message : String(error) });
         return NextResponse.redirect(`${appUrl}/payment/failed?reason=server_error`);
@@ -590,11 +736,18 @@ export async function POST(request: NextRequest) {
 
         const transaction = await prisma.transaction.findUnique({ where: { tranId: tran_id } });
         if (transaction && !transaction.processedAt) {
-            await prisma.transaction.update({
-                where: { tranId: tran_id },
-                data: { status: "FAILED", processedAt: new Date(), rawIpnPayload: rawPayload },
-            });
+            await prisma.$transaction([
+                prisma.transaction.update({
+                    where: { tranId: tran_id },
+                    data: { status: "FAILED", processedAt: new Date(), rawIpnPayload: rawPayload },
+                }),
+                prisma.order.updateMany({
+                    where: { id: transaction.orderId, status: "PENDING" },
+                    data: { status: "FAILED" },
+                }),
+            ]);
         }
+
         log.info("Payment failed callback received", { tran_id });
         return NextResponse.redirect(`${appUrl}/payment/failed?tran_id=${tran_id}`);
     } catch (error) {
@@ -626,11 +779,18 @@ export async function POST(request: NextRequest) {
 
         const transaction = await prisma.transaction.findUnique({ where: { tranId: tran_id } });
         if (transaction && !transaction.processedAt) {
-            await prisma.transaction.update({
-                where: { tranId: tran_id },
-                data: { status: "CANCELLED", processedAt: new Date(), rawIpnPayload: rawPayload },
-            });
+            await prisma.$transaction([
+                prisma.transaction.update({
+                    where: { tranId: tran_id },
+                    data: { status: "CANCELLED", processedAt: new Date(), rawIpnPayload: rawPayload },
+                }),
+                prisma.order.updateMany({
+                    where: { id: transaction.orderId, status: "PENDING" },
+                    data: { status: "CANCELLED" },
+                }),
+            ]);
         }
+
         log.info("Payment cancelled by user", { tran_id });
         return NextResponse.redirect(`${appUrl}/payment/cancelled?tran_id=${tran_id}`);
     } catch (error) {
@@ -645,69 +805,34 @@ export async function POST(request: NextRequest) {
 #### app/api/payment/ipn
 ```bash
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
 import { log } from "@/lib/logger";
 import { ipnPayloadSchema } from "@/lib/validations/payment.schema";
-import { validateTransaction, isValidationStatusSuccess, isValidationAmountMatching } from "@/lib/services/sslcommerz.service";
+import { finalizeTransactionPayment } from "@/lib/services/order.service";
 
 // SSLCommerz-er server theke background e ashe, browser-er upor depend kore na —
-// eta e sob theke reliable source. Business logic fail holeo sob shomoy 200 return
+// sob theke reliable source. Business logic fail holeo sob shomoy HTTP 200 return
 // kori, noyto SSLCommerz infinite retry korte thakbe.
 export async function POST(request: NextRequest) {
     try {
         const formData = await request.formData();
         const rawPayload = Object.fromEntries(formData.entries());
         const parsed = ipnPayloadSchema.safeParse(rawPayload);
+
         if (!parsed.success) {
             log.warn("Invalid IPN payload", { rawPayload });
             return NextResponse.json({ status: "error", message: "Invalid IPN payload" }, { status: 200 });
         }
-        const { tran_id, val_id } = parsed.data;
 
-        const transaction = await prisma.transaction.findUnique({ where: { tranId: tran_id } });
-        if (!transaction) {
-            log.error("IPN for unknown tran_id", { tran_id });
+        const { tran_id, val_id } = parsed.data;
+        const result = await finalizeTransactionPayment(tran_id, val_id);
+
+        if (result.outcome === "not_found") {
             return NextResponse.json({ status: "error", message: "Unknown transaction" }, { status: 200 });
         }
-
-        // Idempotency — duplicate/retry IPN skip
-        if (transaction.processedAt) {
-            return NextResponse.json({ status: "success", message: "Already processed" }, { status: 200 });
+        if (result.outcome === "success" || result.outcome === "already_processed") {
+            return NextResponse.json({ status: "success", message: "IPN processed" }, { status: 200 });
         }
-
-        const validation = await validateTransaction(val_id);
-
-        if (!isValidationStatusSuccess(validation)) {
-            await prisma.transaction.update({
-                where: { tranId: tran_id },
-                data: { status: "FAILED", rawIpnPayload: rawPayload, rawValidationResponse: validation as object },
-            });
-            return NextResponse.json({ status: "error", message: "Validation failed" }, { status: 200 });
-        }
-        if (!isValidationAmountMatching(validation, Number(transaction.amount))) {
-            log.error("IPN amount mismatch — possible tampering", { tran_id });
-            await prisma.transaction.update({
-                where: { tranId: tran_id },
-                data: { status: "FAILED", rawIpnPayload: rawPayload, rawValidationResponse: validation as object },
-            });
-            return NextResponse.json({ status: "error", message: "Amount mismatch" }, { status: 200 });
-        }
-
-        await prisma.$transaction([
-            prisma.transaction.update({
-                where: { tranId: tran_id },
-                data: {
-                    status: "VALID", valId: validation.val_id, bankTranId: validation.bank_tran_id,
-                    cardType: validation.card_type, cardIssuer: validation.card_issuer,
-                    storeAmount: validation.store_amount ? Number(validation.store_amount) : undefined,
-                    rawIpnPayload: rawPayload, rawValidationResponse: validation as object, processedAt: new Date(),
-                },
-            }),
-            prisma.order.update({ where: { id: transaction.orderId }, data: { status: "PAID" } }),
-        ]);
-
-        log.info("IPN verified, order paid", { tran_id, orderId: transaction.orderId });
-        return NextResponse.json({ status: "success", message: "IPN processed" }, { status: 200 });
+        return NextResponse.json({ status: "error", message: result.outcome }, { status: 200 });
     } catch (error) {
         log.error("IPN unexpected error", { error: error instanceof Error ? error.message : String(error) });
         return NextResponse.json({ status: "error", message: "Internal error" }, { status: 200 });
@@ -721,17 +846,19 @@ export async function POST(request: NextRequest) {
 
 | Requirement | Kothay |
 |---|---|
-| Zod validation | `payment.schema.ts`, sob route-e `safeParse` |
-| Prisma transaction save | `Transaction` model, `prisma.transaction.create/update` |
+| Zod validation | `payment.schema.ts` — `createOrderSchema`, `initPaymentSchema`, `sslCallbackSchema`, `ipnPayloadSchema` |
+| Prisma transaction save | `Transaction` model, sob route-e `create/update` |
 | Unique `tran_id` | `generateTranId()` + DB collision-check loop |
 | Logging | `logger.ts` — structured JSON |
-| Service layer | `sslcommerz.service.ts` |
+| Service layer | `sslcommerz.service.ts` (SSLCommerz API) + `order.service.ts` (business logic) |
 | Secrets `.env`-e | Kono hardcoded value nai |
 | `APP_URL` `.env` theke | Sob callback URL dynamic |
-| Customer/product DB theke | `init/route.ts`-e `Order` fetch |
-| Success callback-e `tran_id` verify | DB lookup + Validation API call |
-| IPN verify | Same Validation API, server-to-server |
-| Duplicate payment protection | `tranId` unique + existing-INITIATED reuse |
-| Idempotency | `Transaction.processedAt` field |
+| Customer/product DB theke | `orders/route.ts`-e Order create, `init/route.ts`-e Order+Product fetch |
+| Order create + price integrity | `orders/route.ts` — `Product.price × quantity` server-side calculate |
+| Stock management | `order.service.ts` — payment verified hole atomic-e `Product.stock` decrement |
+| Success callback-e `tran_id` verify | `order.service.ts` → `finalizeTransactionPayment()` |
+| IPN verify | Same function, IPN route-e reuse |
+| Duplicate payment protection | `tranId` unique + non-expired INITIATED transaction reuse |
+| Idempotency | `Transaction.processedAt` + `Order.updateMany` PENDING-guard (double layer) |
 
-**Setup**: `npx prisma migrate dev --name add_payment_module` → `.env` fill up → `init/route.ts`-e auth ar customer-object wire up koren → `npm install zod` (na thakle).
+**Setup**: `npx prisma migrate dev --name init_production_schema` → `.env` fill → `orders`/`init` route-e auth wire up koren → `npm install zod` (na thakle).
