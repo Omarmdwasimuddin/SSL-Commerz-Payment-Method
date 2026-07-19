@@ -1009,7 +1009,7 @@ export async function POST(request: NextRequest) {
 #### app/api/payment/cancel
 ```bash
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import  prisma  from "@/lib/prisma";
 import { log } from "@/lib/logger";
 import { sslCallbackSchema } from "@/lib/validations/payment.schema";
 
@@ -1018,6 +1018,10 @@ export async function POST(request: NextRequest) {
     try {
         const formData = await request.formData();
         const rawPayload = Object.fromEntries(formData.entries());
+        // Normalize FormData values to plain strings for JSON storage
+        const rawPayloadJson: Record<string, string> = Object.fromEntries(
+            Object.entries(rawPayload).map(([k, v]) => [k, typeof v === "string" ? v : (v as File).name || ""])
+        );
         const parsed = sslCallbackSchema.safeParse(rawPayload);
         if (!parsed.success) {
             return NextResponse.redirect(`${appUrl}/payment/cancelled?reason=invalid_callback`);
@@ -1029,7 +1033,7 @@ export async function POST(request: NextRequest) {
             await prisma.$transaction([
                 prisma.transaction.update({
                     where: { tranId: tran_id },
-                    data: { status: "CANCELLED", processedAt: new Date(), rawIpnPayload: rawPayload },
+                    data: { status: "CANCELLED", processedAt: new Date(), rawIpnPayload: rawPayloadJson },
                 }),
                 prisma.order.updateMany({
                     where: { id: transaction.orderId, status: "PENDING" },
@@ -1038,10 +1042,10 @@ export async function POST(request: NextRequest) {
             ]);
         }
 
-        log.info("Payment cancelled by user", { tran_id });
+        log.info({ tran_id }, "Payment cancelled by user");
         return NextResponse.redirect(`${appUrl}/payment/cancelled?tran_id=${tran_id}`);
     } catch (error) {
-        log.error("Cancel callback unexpected error", { error: error instanceof Error ? error.message : String(error) });
+        log.error({ error: error instanceof Error ? error.message : String(error) }, "Cancel callback unexpected error");
         return NextResponse.redirect(`${appUrl}/payment/cancelled?reason=server_error`);
     }
 }
