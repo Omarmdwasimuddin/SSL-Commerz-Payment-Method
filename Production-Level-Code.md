@@ -652,9 +652,143 @@ export const { handlers, auth, signIn, signOut } = NextAuth(authConfig);
 ```
 ---
 
+#### lib/auth/password.ts
+```bash
+import bcrypt from "bcryptjs";
+
+const SALT_ROUNDS = 12; // production standard — 10-12 recommended
+
+export async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, SALT_ROUNDS);
+}
+
+export async function verifyPassword(
+  hashValue: string,
+  password: string
+): Promise<boolean> {
+  return bcrypt.compare(password, hashValue);
+}
+```
+---
+
 #### lib/auth.config.ts
 ```bash
+import type { NextAuthConfig } from "next-auth";
+import Credentials from "next-auth/providers/credentials";
+import { verifyPassword } from "@/lib/auth/password";
+import prisma from "@/lib/prisma";
+import { log } from "@/lib/logger";
+import { loginSchema } from "@/lib/validations/auth.schema";
 
+export const authConfig: NextAuthConfig = {
+  providers: [
+    Credentials({
+      credentials: {
+        email: { label: "Email", type: "email" },
+        password: { label: "Password", type: "password" },
+      },
+
+      authorize: async (credentials) => {
+        const requestId = crypto.randomUUID();
+
+        const parsed = loginSchema.safeParse(credentials);
+
+        if (!parsed.success) {
+          log.warn(
+            { 
+                requestId,
+                errors: parsed.error.flatten(), 
+            },
+             "Login validation failed"
+            );
+          return null;
+        }
+        const { email, password } = parsed.data;
+
+        const user = await prisma.user.findUnique({
+             where: { email }, 
+            });
+
+        if (!user) {
+          log.warn(
+            { 
+                requestId,
+                email, 
+            }, 
+            "Login attempt for non-existent email"
+        );
+          return null;
+        }
+
+        if (!user.passwordHash) {
+          log.warn(
+            {
+              requestId,
+              userId: user.id,
+            },
+            "No password hash for user"
+          );
+          return null;
+        }
+
+        const isValidPassword = await verifyPassword(user.passwordHash, password);
+
+        if (!isValidPassword) {
+          log.warn(
+            { 
+                requestId,
+                userId: user.id 
+            }, 
+            "Invalid password attempt"
+        );
+          return null;
+        }
+
+        log.info(
+            { 
+                requestId,
+                userId: user.id 
+            }, 
+            "User authenticated successfully"
+        );
+
+        return {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+        };
+      },
+    }),
+  ],
+
+  session: {
+    strategy: "jwt",
+    maxAge: 30 * 24 * 60 * 60, // 30 days
+  },
+
+  callbacks: {
+    jwt({ token, user }) {
+      if (user) {
+        token.sub = user.id;
+      }
+      return token;
+    },
+    session({ session, token }) {
+      if (token?.sub && session.user) {
+        session.user.id = token.sub;
+      }
+      return session;
+    },
+  },
+
+  pages: {
+    signIn: "/login",
+    error: "/login",
+  },
+
+  useSecureCookies: process.env.NODE_ENV === "production",
+  trustHost: true,
+};
 ```
 ---
 
