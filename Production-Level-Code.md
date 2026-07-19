@@ -35,32 +35,33 @@ datasource db {
 }
 
 enum OrderStatus {
-  PENDING
-  PAID
-  FAILED
-  CANCELLED
+  PENDING   // order created, waiting for payment
+  PAID      // payment verified (via Transaction)
+  FAILED    // SSLCommerz fail callback
+  CANCELLED // SSLCommerz cancel callback
 }
 
 enum TransactionStatus {
-  INITIATED
-  VALID
+  INITIATED // SSLCommerz session create hoise, ekhono pay hoyni
+  VALID     // Validation API confirm korse — final "paid" state
   FAILED
   CANCELLED
   EXPIRED
 }
 
 model User {
-  id        String   @id @default(cuid())
-  name      String
-  email     String   @unique
-  phone     String?
-  address   String?
-  city      String?
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String?   
+  phone        String?
+  address      String?
+  city         String?
 
-  orders    Order[]
+  orders       Order[]
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   @@map("users")
 }
@@ -87,6 +88,7 @@ model Order {
   userId          String
   user            User          @relation(fields: [userId], references: [id])
 
+  // Relation to product
   productId       String
   product         Product       @relation(fields: [productId], references: [id])
 
@@ -94,6 +96,8 @@ model Order {
   totalAmount     Decimal       @db.Decimal(10, 2)
   currency        String        @default("BDT")
 
+  // Customer info snapshot — order er shomoy ja chilo, freeze kore rakha
+  // (User profile porey update hole o order history accurate thake)
   customerName    String
   customerEmail   String
   customerPhone   String
@@ -114,7 +118,7 @@ model Order {
 
 model Transaction {
   id                     String            @id @default(cuid())
-  tranId                 String            @unique
+  tranId                 String            @unique   // duplicate protection-er backbone
 
   orderId                String
   order                  Order             @relation(fields: [orderId], references: [id])
@@ -128,15 +132,16 @@ model Transaction {
 
   valId                  String?
   bankTranId             String?
-  cardType               String?
+  cardType               String?           // e.g. VISA, brac_visa, bkash ইত্যাদি
   cardIssuer             String?
   storeAmount            Decimal?          @db.Decimal(10, 2)
 
+  // Full raw payloads — audit trail o debugging er jonno
   rawInitResponse        Json?
   rawValidationResponse  Json?
   rawIpnPayload          Json?
 
-  processedAt            DateTime?
+  processedAt            DateTime?         // idempotency guard
 
   createdAt              DateTime          @default(now())
   updatedAt              DateTime          @updatedAt
