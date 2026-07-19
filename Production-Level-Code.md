@@ -382,7 +382,7 @@ export function isValidationStatusSuccess(validation: SSLCommerzValidationRespon
 
 #### lib/services/order.service.ts
 ```bash
-import { prisma } from "@/lib/prisma";
+import  prisma  from "@/lib/prisma";
 import { log } from "@/lib/logger";
 import { validateTransaction, isValidationStatusSuccess, isValidationAmountMatching } from "@/lib/services/sslcommerz.service";
 
@@ -402,26 +402,26 @@ export async function finalizeTransactionPayment(tranId: string, valId: string |
     const transaction = await prisma.transaction.findUnique({ where: { tranId } });
 
     if (!transaction) {
-        log.error("Callback for unknown tranId", { tranId });
+        log.error({ tranId }, "Callback for unknown tranId");
         return { outcome: "not_found" };
     }
 
     // Idempotency — ei transaction already process hoye gele (success + IPN duitai
     // kache-kache ashte pare) revalidate na kore shorashori result ferot dei
     if (transaction.processedAt) {
-        log.info("Transaction already processed, skipping re-verification", { tranId });
+        log.info({ tranId }, "Transaction already processed, skipping re-verification");
         return { outcome: "already_processed", orderId: transaction.orderId };
     }
 
     if (!valId) {
-        log.warn("Callback missing val_id", { tranId });
+        log.warn({ tranId }, "Callback missing val_id");
         return { outcome: "missing_val_id", orderId: transaction.orderId };
     }
 
     const validation = await validateTransaction(valId);
 
     if (!isValidationStatusSuccess(validation)) {
-        log.warn("Validation API returned non-success status", { tranId, validation });
+        log.warn({ tranId, validation }, "Validation API returned non-success status");
         await prisma.transaction.update({
             where: { tranId },
             data: { status: "FAILED", rawValidationResponse: validation as object, processedAt: new Date() },
@@ -432,9 +432,9 @@ export async function finalizeTransactionPayment(tranId: string, valId: string |
     }
 
     if (!isValidationAmountMatching(validation, Number(transaction.amount))) {
-        log.error("Validation amount mismatch — possible tampering", {
+        log.error({
             tranId, expected: transaction.amount, received: validation.currency_amount ?? validation.amount,
-        });
+        }, "Validation amount mismatch — possible tampering");
         await prisma.transaction.update({
             where: { tranId },
             data: { status: "FAILED", rawValidationResponse: validation as object, processedAt: new Date() },
@@ -446,7 +446,7 @@ export async function finalizeTransactionPayment(tranId: string, valId: string |
     // ar Product stock decrement — sob ekshathe atomic
     const order = await prisma.order.findUnique({ where: { id: transaction.orderId } });
     if (!order) {
-        log.error("Transaction points to a missing order", { tranId, orderId: transaction.orderId });
+        log.error({ tranId, orderId: transaction.orderId }, "Transaction points to a missing order");
         return { outcome: "not_found" };
     }
 
@@ -477,17 +477,17 @@ export async function finalizeTransactionPayment(tranId: string, valId: string |
     ]);
 
     if (orderUpdateResult.count === 0) {
-        log.warn("Order was not in PENDING state during finalize — likely already paid via another transaction", {
+        log.warn({
             orderId: order.id, tranId,
-        });
+        }, "Order was not in PENDING state during finalize — likely already paid via another transaction");
     }
     if (stockUpdateResult.count === 0) {
-        log.error("Stock decrement failed after payment — possible oversell, needs manual review", {
+        log.error({
             orderId: order.id, productId: order.productId,
-        });
+        }, "Stock decrement failed after payment — possible oversell, needs manual review");
     }
 
-    log.info("Payment verified and order finalized", { tranId, orderId: order.id });
+    log.info({ tranId, orderId: order.id }, "Payment verified and order finalized");
     return { outcome: "success", orderId: order.id };
 }
 ```
