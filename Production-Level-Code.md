@@ -496,37 +496,90 @@ export async function finalizeTransactionPayment(tranId: string, valId: string |
 
 #### app/api/orders  (checkout — Order create)
 ```bash
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, userAgent } from "next/server";
 import { z } from "zod";
-import { prisma } from "@/lib/prisma";
+import  prisma  from "@/lib/prisma";
 import { log } from "@/lib/logger";
 import { createOrderSchema } from "@/lib/validations/payment.schema";
-// import { auth } from "@/lib/auth"; // Apnar NextAuth.js v5 setup theke import korben
+import { handlePrismaError } from "@/lib/errors/handlePrismaError";
+import { auth } from "@/lib/auth"; 
 
 export async function POST(request: NextRequest) {
+    const requestId = crypto.randomUUID();
     try {
         // 1. Auth check
-        // const session = await auth();
-        // if (!session?.user?.id) return NextResponse.json({ status: "error", message: "Unauthorized" }, { status: 401 });
-        const userId = request.headers.get("x-debug-user-id");
-        if (!userId) return NextResponse.json({ status: "error", message: "Unauthorized" }, { status: 401 });
+        const session = await auth();
+        if (!session?.user?.id) {
+            log.warn(
+                {
+                    requestId,
+                    ip: request.headers.get("x-forwarded-for") ?? "unknown",
+                    userAgent: request.headers.get("user-agent"),
+                },
+                "Unauthorized order creation attempt"
+            )
+            return NextResponse.json(
+                { status: "error", requestId, message: "Unauthorized" }, 
+                { status: 401 }
+            );
+        };
+
+        const userId = session.user.id;
 
         // 2. Body validation
         const body = await request.json().catch(() => null);
         const parsed = createOrderSchema.safeParse(body);
+
         if (!parsed.success) {
+            log.warn(
+                {
+                    requestId,
+                    userId,
+                    validationErrors: z.treeifyError(parsed.error)
+                },
+                "Order validation failed"
+            )
             return NextResponse.json(
-                { status: "error", message: "Invalid request body", errors: z.treeifyError(parsed.error) },
+                { status: "error", requestId, message: "Invalid request body", errors: z.treeifyError(parsed.error) },
                 { status: 400 }
             );
         }
         const { productId, quantity, customerName, customerEmail, customerPhone, customerAddress, customerCity } = parsed.data;
 
         // 3. Product DB theke fetch — price client theke kokhono trust kora hoy na
-        const product = await prisma.product.findUnique({ where: { id: productId } });
-        if (!product) return NextResponse.json({ status: "error", message: "Product not found" }, { status: 404 });
+        const product = await prisma.product.findUnique({
+             where: { id: productId } 
+            });
+
+        if (!product) {
+            log.warn(
+                {
+                    requestId,
+                    userId,
+                    productId,
+                },
+                "Product not found"
+            )
+            return NextResponse.json(
+                { status: "error", requestId, message: "Product not found" },
+                { status: 404 }
+            );
+        }
         if (product.stock < quantity) {
-            return NextResponse.json({ status: "error", message: "Insufficient stock" }, { status: 409 });
+            log.warn(
+                {
+                    requestId,
+                    userId,
+                    productId,
+                    requestedQuantity: quantity,
+                    availableStock: product.stock,
+                },
+                "Insufficient stock"
+            )
+            return NextResponse.json(
+                { status: "error", message: "Insufficient stock" },
+                { status: 409 }
+            );
         }
 
         // 4. Server-side price calculation
@@ -542,16 +595,37 @@ export async function POST(request: NextRequest) {
             },
         });
 
-        log.info("Order created", { orderId: order.id, productId, userId });
+        log.info(
+            {
+                requestId,
+                orderId: order.id,
+                productId, 
+                userId,
+                quantity,
+                totalAmount,
+            }, 
+            "Order created"
+        );
 
-        return NextResponse.json({
-            status: "success",
-            message: "Order created successfully",
-            data: { orderId: order.id, totalAmount },
-        });
+        return NextResponse.json(
+            { status: "success", requestId, message: "Order created successfully", data: { orderId: order.id, totalAmount }},
+            { status: 201 }
+        );
     } catch (error) {
-        log.error("Order creation unexpected error", { error: error instanceof Error ? error.message : String(error) });
-        return NextResponse.json({ status: "error", message: "Something went wrong while creating order" }, { status: 500 });
+        const { status, message } = handlePrismaError(error);
+        log.error(
+        { 
+            requestId,
+            err: error instanceof Error 
+                ? { message: error.message, stack: error.stack, name: error.name }
+                : String(error),
+        },
+        message
+    )
+    return NextResponse.json(
+        { status: "fail", requestId, message },
+        { status }
+    )
     }
 }
 ```
