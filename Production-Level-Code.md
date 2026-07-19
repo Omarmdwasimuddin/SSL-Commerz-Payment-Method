@@ -647,6 +647,19 @@ export const { handlers, auth, signIn, signOut } = NextAuth(authConfig);
 ```
 ---
 
+#### lib/auth.config.ts
+```bash
+
+```
+---
+
+#### app/api/auth/[...nextauth]/route.ts
+```bash
+import { handlers } from "@/lib/auth";
+export const { GET, POST } = handlers;
+```
+---
+
 #### app/api/payment/init
 ```bash
 import { NextRequest, NextResponse } from "next/server";
