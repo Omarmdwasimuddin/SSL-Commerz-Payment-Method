@@ -501,7 +501,7 @@ export async function finalizeTransactionPayment(tranId: string, valId: string |
 
 #### app/api/orders  (checkout — Order create)
 ```bash
-import { NextRequest, NextResponse, userAgent } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import  prisma  from "@/lib/prisma";
 import { log } from "@/lib/logger";
@@ -527,7 +527,7 @@ export async function POST(request: NextRequest) {
                 { status: "error", requestId, message: "Unauthorized" }, 
                 { status: 401 }
             );
-        };
+        }
 
         const userId = session.user.id;
 
