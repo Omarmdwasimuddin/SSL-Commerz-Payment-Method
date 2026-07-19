@@ -632,6 +632,21 @@ export async function POST(request: NextRequest) {
 
 ---
 
+#### Package Install
+```bash
+npm install next-auth@beta
+```
+---
+
+#### /lib/auth.ts
+```bash
+import NextAuth from "next-auth";
+import { authConfig } from "@/lib/auth.config"; 
+
+export const { handlers, auth, signIn, signOut } = NextAuth(authConfig);
+```
+---
+
 #### app/api/payment/init
 ```bash
 import { NextRequest, NextResponse } from "next/server";
