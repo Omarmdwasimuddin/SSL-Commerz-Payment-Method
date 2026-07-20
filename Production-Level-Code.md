@@ -803,31 +803,55 @@ export const { GET, POST } = handlers;
 ```bash
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { prisma } from "@/lib/prisma";
+import  prisma  from "@/lib/prisma";
 import { log } from "@/lib/logger";
 import { initPaymentSchema } from "@/lib/validations/payment.schema";
 import { generateTranId, initiatePayment } from "@/lib/services/sslcommerz.service";
-// import { auth } from "@/lib/auth";
+import { handlePrismaError } from "@/lib/errors/handlePrismaError";
+import { auth } from "@/lib/auth";
 
 const SESSION_VALIDITY_MINUTES = 55; // SSLCommerz session ~1hr e expire hoy, tai buffer rekhe 55 min
 
 export async function POST(request: NextRequest) {
+    const requestId = crypto.randomUUID();
     try {
         // 1. Auth check
-        // const session = await auth();
-        // if (!session?.user?.id) return NextResponse.json({ status: "error", message: "Unauthorized" }, { status: 401 });
-        const userId = request.headers.get("x-debug-user-id");
-        if (!userId) return NextResponse.json({ status: "error", message: "Unauthorized" }, { status: 401 });
+        const session = await auth();
+        const userId = session?.user?.id;
+        if (!userId) {
+            log.warn(
+                {
+                    requestId,
+                    ip: request.headers.get("x-forwarded-for") ?? "unknown",
+                    userAgent: request.headers.get("user-agent"),
+                },
+                "Unauthorized payment initialization attempt"
+            )
+            return NextResponse.json(
+                { status: "error", requestId, message: "Unauthorized" }, 
+                { status: 401 });
+        }
+
 
         // 2. Body validation
         const body = await request.json().catch(() => null);
         const parsed = initPaymentSchema.safeParse(body);
+
         if (!parsed.success) {
+            log.warn(
+                {
+                    requestId,
+                    userId,
+                    validationErrors: z.treeifyError(parsed.error),
+                },
+                "Invalid payment initialization request"
+            )
             return NextResponse.json(
-                { status: "error", message: "Invalid request body", errors: z.treeifyError(parsed.error) },
+                { status: "error", requestId, message: "Invalid request body", errors: z.treeifyError(parsed.error) },
                 { status: 400 }
             );
         }
+
         const { orderId } = parsed.data;
 
         // 3. Order + Product DB theke fetch (relation include kore)
@@ -835,27 +859,74 @@ export async function POST(request: NextRequest) {
             where: { id: orderId },
             include: { product: true },
         });
-        if (!order) return NextResponse.json({ status: "error", message: "Order not found" }, { status: 404 });
+        
+        if (!order) {
+            log.warn(
+                {
+                    requestId,
+                    userId,
+                    orderId,
+                },
+                "Order not found"
+            )
+            return NextResponse.json(
+                { status: "error", requestId, message: "Order not found" }, 
+                { status: 404 }
+            );
+        }
+
         if (order.userId !== userId) {
-            log.warn("Order ownership mismatch", { orderId, userId });
-            return NextResponse.json({ status: "error", message: "Forbidden" }, { status: 403 });
+            log.warn(
+                { 
+                    requestId,
+                    orderId, 
+                    userId,
+                    orderOwnerId: order.userId, 
+                },
+                "Order ownership mismatch"
+            );
+            return NextResponse.json(
+                { status: "error", requestId, message: "Forbidden" }, 
+                { status: 403 }
+            );
         }
         if (order.status !== "PENDING") {
-            return NextResponse.json({ status: "error", message: `Order is already ${order.status.toLowerCase()}` }, { status: 409 });
+            log.warn(
+                {
+                    requestId,
+                    orderId,
+                    userId,
+                    orderStatus: order.status,
+                },
+                "Payment initialization attempted for non-pending order"
+            )
+            return NextResponse.json(
+                { status: "error", requestId, message: `Order is already ${order.status.toLowerCase()}` }, 
+                { status: 409 }
+            );
         }
 
         // 4. Duplicate protection — recent (not expired) INITIATED session thakle reuse
         const sessionCutoff = new Date(Date.now() - SESSION_VALIDITY_MINUTES * 60 * 1000);
+
         const existingTransaction = await prisma.transaction.findFirst({
             where: { orderId: order.id, status: "INITIATED", createdAt: { gte: sessionCutoff } },
             orderBy: { createdAt: "desc" },
         });
+
         if (existingTransaction?.gatewayPageURL) {
-            log.info("Reusing existing initiated transaction", { orderId, tranId: existingTransaction.tranId });
-            return NextResponse.json({
-                status: "success",
-                data: { GatewayPageURL: existingTransaction.gatewayPageURL, tranId: existingTransaction.tranId },
-            });
+            log.info(
+                { 
+                    requestId,
+                    orderId, 
+                    tranId: existingTransaction.tranId,
+                    transactionId: existingTransaction.id,
+                },
+                "Reusing existing initiated transaction"
+            );
+            return NextResponse.json(
+                { status: "success", requestId, data: { GatewayPageURL: existingTransaction.gatewayPageURL, tranId: existingTransaction.tranId },}
+            );
         }
 
         // 5. Unique tran_id
@@ -863,7 +934,10 @@ export async function POST(request: NextRequest) {
         let attempt = 0;
         while (await prisma.transaction.findUnique({ where: { tranId } })) {
             if (++attempt > 5) {
-                return NextResponse.json({ status: "error", message: "Could not generate unique tran_id" }, { status: 500 });
+                return NextResponse.json(
+                    { status: "error", requestId, message: "Could not generate unique tran_id" }, 
+                    { status: 500 }
+                );
             }
             tranId = generateTranId();
         }
@@ -886,14 +960,26 @@ export async function POST(request: NextRequest) {
         );
 
         if (sslResponse.status !== "SUCCESS" || !sslResponse.GatewayPageURL) {
-            log.error("SSLCommerz init failed", { orderId, tranId, reason: sslResponse.failedreason });
+            log.error(
+                { 
+                    requestId,
+                    orderId, 
+                    tranId, 
+                    status: sslResponse.status,
+                    failedReason: sslResponse.failedreason, 
+                },
+                "SSLCommerz payment initialization failed"
+            );
             await prisma.transaction.create({
                 data: {
                     tranId, orderId: order.id, amount: order.totalAmount, currency: order.currency,
                     status: "FAILED", rawInitResponse: sslResponse as object,
                 },
             });
-            return NextResponse.json({ status: "error", message: sslResponse.failedreason || "Init failed" }, { status: 400 });
+            return NextResponse.json(
+                { status: "error", requestId, message: sslResponse.failedreason || "Init failed" }, 
+                { status: 400 }
+            );
         }
 
         // 7. Transaction save
@@ -905,14 +991,36 @@ export async function POST(request: NextRequest) {
             },
         });
 
-        log.info("Payment session initiated", { orderId, tranId });
+        log.info(
+            { 
+                requestId,
+                orderId,
+                userId, 
+                tranId,
+                amount: order.totalAmount,
+                currency: order.currency,
+            },
+            "Payment initialized successfully"
+        );
         return NextResponse.json({
-            status: "success",
+            status: "success", requestId,
             data: { GatewayPageURL: sslResponse.GatewayPageURL, tranId },
         });
     } catch (error) {
-        log.error("Payment init unexpected error", { error: error instanceof Error ? error.message : String(error) });
-        return NextResponse.json({ status: "error", message: "Something went wrong" }, { status: 500 });
+        const { status, message } = handlePrismaError(error);
+                log.error(
+                { 
+                    requestId,
+                    err: error instanceof Error 
+                        ? { message: error.message, stack: error.stack, name: error.name }
+                        : String(error),
+                },
+                message
+            )
+            return NextResponse.json(
+                { status: "fail", requestId, message },
+                { status }
+            )
     }
 }
 ```
