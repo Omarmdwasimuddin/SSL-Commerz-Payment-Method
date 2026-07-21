@@ -262,20 +262,29 @@ APP_URL=http://localhost:3000
 ```bash
 import { PrismaClient } from "@/app/generated/prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
+import { env } from "@/lib/env";
 
-const globalForPrisma = global as unknown as { 
-    prisma: PrismaClient;
- };
+const globalForPrisma = globalThis as unknown as {
+  prisma?: PrismaClient;
+};
 
- const adapter = new PrismaPg({
-    connectionString: process.env.DATABASE_URL,
- });
+const adapter = new PrismaPg({
+  connectionString: env.DATABASE_URL,
+});
 
- const prisma = globalForPrisma.prisma || new PrismaClient({ adapter, log: ['info', 'query', 'error', 'warn'] });
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    adapter,
+    log: ["info", "warn", "error"],
+  });
 
- if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+if (env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
 
- export default prisma;
+export default prisma;
+
 ```
 
 ---
@@ -283,22 +292,17 @@ const globalForPrisma = global as unknown as {
 #### lib/logger.ts
 ```bash
 import pino from "pino";
+import { env } from "@/lib/env";
 
 export const log = pino({
-    level: process.env.LOG_LEVEL || "info",
-    timestamp: pino.stdTimeFunctions.isoTime,
-
-    transport:
-        process.env.NODE_ENV === "development"
-            ? {
-                  target: "pino-pretty",
-                  options: {
-                      colorize: true,
-                      translateTime: "SYS:standard",
-                  },
-              }
-            : undefined,
+  level: env.LOG_LEVEL,
+  timestamp: pino.stdTimeFunctions.isoTime,
+  redact: {
+    paths: ["cus_email", "cus_phone", "store_passwd", "card", "card.*"],
+    censor: "[redacted]",
+  },
 });
+
 ```
 ---
 
@@ -306,17 +310,28 @@ export const log = pino({
 ```bash
 import { Prisma } from "@/app/generated/prisma";
 
-
-export function handlePrismaError(error: unknown) {
+export function handlePrismaError(error: unknown): {
+  status: number;
+  message: string;
+} {
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
     switch (error.code) {
-      case "P2002": return { status: 409, message: "Duplicate entry" };
-      case "P2003": return { status: 400, message: "Invalid reference" };
-      case "P2025": return { status: 404, message: "Not found" };
-      default: return { status: 500, message: "Database error" };
+      case "P2002":
+        return {
+          status: 409,
+          message: "A record with this value already exists",
+        };
+      case "P2003":
+        return { status: 400, message: "Referenced record does not exist" };
+      case "P2025":
+        return { status: 404, message: "Record not found" };
+      default:
+        return { status: 500, message: "Something went wrong" };
     }
   }
-  return { status: 500, message: "Internal server error" };
+
+  return { status: 500, message: "Something went wrong" };
 }
+
 ```
 ---
