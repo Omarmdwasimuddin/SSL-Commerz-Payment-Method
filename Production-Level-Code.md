@@ -890,6 +890,350 @@ function updateOrderStatus(
 ```
 ---
 
+#### services/payment.service.ts
+```bash
+import { OrderStatus, PaymentStatus, Prisma } from "@/app/generated/prisma";
+import { env } from "@/lib/env";
+import prisma from "@/lib/prisma";
+import { initSession } from "@/lib/sslcommerz/client";
+import { getOrderWithTotal } from "@/services/order.service";
+
+export type InitiatePaymentResult = {
+  gatewayUrl: string;
+  tranId: string;
+};
+
+export class PaymentInitError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "PaymentInitError";
+  }
+}
+
+export async function initiatePayment(
+  orderId: string,
+  idempotencyKey?: string,
+): Promise<InitiatePaymentResult> {
+  const { order, total } = await getOrderWithTotal(orderId);
+
+  if (order.status !== OrderStatus.PENDING) {
+    throw new PaymentInitError("Order is not payable", 409);
+  }
+
+  if (idempotencyKey) {
+    const cached = await prisma.idempotencyKey.findUnique({
+      where: { key: idempotencyKey },
+    });
+
+    if (cached?.responseBody) {
+      return cached.responseBody as InitiatePaymentResult;
+    }
+
+    if (cached) {
+      throw new PaymentInitError("Payment initiation is already in progress", 409);
+    }
+  }
+
+  const existingPayment = await prisma.payment.findFirst({
+    where: {
+      orderId,
+      status: {
+        in: [PaymentStatus.INITIATED, PaymentStatus.PENDING],
+      },
+    },
+    orderBy: {
+      createdAt: "desc",
+    },
+  });
+
+  if (existingPayment) {
+    if (!existingPayment.gatewayUrl) {
+      throw new PaymentInitError(
+        "Payment initiation is already in progress",
+        409,
+      );
+    }
+
+    // Reuse an active SSLCommerz session instead of invalidating/recreating it:
+    // a refresh or retry should send the customer to the same unpaid attempt.
+    const response = {
+      gatewayUrl: existingPayment.gatewayUrl,
+      tranId: existingPayment.tranId,
+    };
+
+    if (idempotencyKey) {
+      await cacheIdempotentResponse(idempotencyKey, orderId, response);
+    }
+
+    return response;
+  }
+
+  if (idempotencyKey) {
+    try {
+      await prisma.idempotencyKey.create({
+        data: {
+          key: idempotencyKey,
+          orderId,
+        },
+      });
+    } catch (error) {
+      if (isUniqueConstraintError(error)) {
+        const cached = await prisma.idempotencyKey.findUnique({
+          where: { key: idempotencyKey },
+        });
+
+        if (cached?.responseBody) {
+          return cached.responseBody as InitiatePaymentResult;
+        }
+
+        throw new PaymentInitError(
+          "Payment initiation is already in progress",
+          409,
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  const tranId = crypto.randomUUID();
+  const payment = await prisma.payment.create({
+    data: {
+      orderId,
+      tranId,
+      amount: total,
+      currency: order.currency,
+      status: PaymentStatus.INITIATED,
+    },
+  });
+
+  const initResponse = await initSession({
+    tranId,
+    amount: total.toFixed(2),
+    currency: order.currency,
+    ...buildCallbackUrls(),
+    product: buildProductSnapshot(order.items),
+  });
+
+  const gatewayUrl = initResponse.GatewayPageURL;
+
+  if (!gatewayUrl) {
+    throw new PaymentInitError(
+      initResponse.failedreason ?? "SSLCommerz did not return a gateway URL",
+      502,
+    );
+  }
+
+  await prisma.payment.update({
+    where: { id: payment.id },
+    data: {
+      sessionKey: initResponse.sessionkey,
+      gatewayUrl,
+      rawInitResponse: toPrismaJson(initResponse),
+    },
+  });
+
+  const response = { gatewayUrl, tranId };
+
+  if (idempotencyKey) {
+    await cacheIdempotentResponse(idempotencyKey, orderId, response);
+  }
+
+  return response;
+}
+
+function buildCallbackUrls() {
+  const appUrl = env.APP_URL.replace(/\/$/, "");
+
+  return {
+    successUrl: `${appUrl}/api/payment/success`,
+    failUrl: `${appUrl}/api/payment/fail`,
+    cancelUrl: `${appUrl}/api/payment/cancel`,
+    ipnUrl: `${appUrl}/api/payment/ipn`,
+  };
+}
+
+function buildProductSnapshot(
+  items: Array<{ productName: string; quantity: number }>,
+) {
+  const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
+
+  return {
+    name:
+      items.length === 1
+        ? items[0].productName
+        : `${items.length} order items`,
+    quantity: totalQuantity,
+  };
+}
+
+async function cacheIdempotentResponse(
+  idempotencyKey: string,
+  orderId: string,
+  response: InitiatePaymentResult,
+) {
+  await prisma.idempotencyKey.upsert({
+    where: { key: idempotencyKey },
+    create: {
+      key: idempotencyKey,
+      orderId,
+      responseBody: response,
+    },
+    update: {
+      orderId,
+      responseBody: response,
+    },
+  });
+}
+
+function isUniqueConstraintError(error: unknown) {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2002"
+  );
+}
+
+function toPrismaJson(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+```
+---
+
+#### app/api/payment/init/route.ts
+```bash
+import { NextResponse, type NextRequest } from "next/server";
+import { z } from "zod";
+import { handlePrismaError } from "@/lib/errors/handlePrismaError";
+import { log } from "@/lib/logger";
+import {
+  initiatePayment,
+  PaymentInitError,
+} from "@/services/payment.service";
+import { initPaymentSchema } from "@/validations/payment.schema";
+
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 5;
+const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
+
+export async function POST(request: NextRequest) {
+  const requestId = crypto.randomUUID();
+  const path = request.nextUrl.pathname;
+  const method = request.method;
+
+  log.info({ requestId, path, method }, "Payment init request received");
+
+  try {
+    const body = await request.json();
+    const input = initPaymentSchema.parse(body);
+    const rateLimitKey = getClientIp(request);
+
+    if (isRateLimited(rateLimitKey)) {
+      log.info({ requestId, path, method, rateLimitKey }, "Rate limit exceeded");
+
+      return NextResponse.json(
+        {
+          status: "fail",
+          requestId,
+          message: "Too many payment initiation requests",
+        },
+        { status: 429 },
+      );
+    }
+
+    const data = await initiatePayment(input.orderId, input.idempotencyKey);
+
+    log.info(
+      { requestId, path, method, orderId: input.orderId, tranId: data.tranId },
+      "Payment init request completed",
+    );
+
+    return NextResponse.json({
+      status: "success",
+      requestId,
+      message: "Payment initiated",
+      data,
+    });
+  } catch (error) {
+    const handled = toHttpError(error);
+
+    log.error(
+      { requestId, path, method, error: serializeError(error) },
+      "Payment init request failed",
+    );
+
+    return NextResponse.json(
+      {
+        status: "fail",
+        requestId,
+        message: handled.message,
+      },
+      { status: handled.status },
+    );
+  }
+}
+
+function isRateLimited(key: string) {
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(key);
+
+  if (!bucket || bucket.resetAt <= now) {
+    rateLimitBuckets.set(key, {
+      count: 1,
+      resetAt: now + RATE_LIMIT_WINDOW_MS,
+    });
+
+    return false;
+  }
+
+  bucket.count += 1;
+  return bucket.count > RATE_LIMIT_MAX_REQUESTS;
+}
+
+function getClientIp(request: NextRequest) {
+  const forwardedFor = request.headers.get("x-forwarded-for");
+
+  if (forwardedFor) {
+    return forwardedFor.split(",")[0].trim();
+  }
+
+  return request.headers.get("x-real-ip") ?? "unknown";
+}
+
+function toHttpError(error: unknown) {
+  if (error instanceof z.ZodError) {
+    return { status: 400, message: "Invalid request body" };
+  }
+
+  if (error instanceof SyntaxError) {
+    return { status: 400, message: "Invalid JSON body" };
+  }
+
+  if (error instanceof PaymentInitError) {
+    return { status: error.status, message: error.message };
+  }
+
+  return handlePrismaError(error);
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+
+  return { error };
+}
+
+```
+---
+
 ####
 ```bash
 
