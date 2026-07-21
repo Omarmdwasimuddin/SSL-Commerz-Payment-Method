@@ -335,3 +335,153 @@ export function handlePrismaError(error: unknown): {
 
 ```
 ---
+
+#### lib/sslcommerz/types.ts
+```bash
+type SslCommerzPrimitive = string | number | boolean | null;
+
+export type SessionRequestPayload = {
+  store_id: string;
+  store_passwd: string;
+  total_amount: string;
+  currency: string;
+  tran_id: string;
+  success_url: string;
+  fail_url: string;
+  cancel_url: string;
+  ipn_url: string;
+  product_name: string;
+  product_category: string;
+  product_profile: string;
+  cus_name: string;
+  cus_email: string;
+  cus_add1: string;
+  cus_city: string;
+  cus_postcode: string;
+  cus_country: string;
+  cus_phone: string;
+  shipping_method: string;
+  num_of_item: string;
+  ship_name: string;
+  ship_add1: string;
+  ship_city: string;
+  ship_postcode: string;
+  ship_country: string;
+  value_a?: string;
+  value_b?: string;
+  value_c?: string;
+  value_d?: string;
+};
+
+export type SessionResponse = {
+  status?: string;
+  failedreason?: string;
+  sessionkey?: string;
+  GatewayPageURL?: string;
+  storeBanner?: string;
+  storeLogo?: string;
+  desc?: SslCommerzPrimitive[];
+  is_direct_pay_enable?: string;
+  directPaymentURL?: string;
+  redirectGatewayURL?: string;
+  redirectGatewayURLFailed?: string;
+  GatewayPageURLFailed?: string;
+  [key: string]: unknown;
+};
+
+export type ValidationResponse = {
+  status?: string;
+  tran_date?: string;
+  tran_id?: string;
+  val_id?: string;
+  amount?: string;
+  store_amount?: string;
+  currency?: string;
+  bank_tran_id?: string;
+  card_type?: string;
+  card_no?: string;
+  card_issuer?: string;
+  card_brand?: string;
+  card_issuer_country?: string;
+  card_issuer_country_code?: string;
+  currency_type?: string;
+  currency_amount?: string;
+  currency_rate?: string;
+  base_fair?: string;
+  value_a?: string;
+  value_b?: string;
+  value_c?: string;
+  value_d?: string;
+  risk_title?: string;
+  risk_level?: string;
+  validated_on?: string;
+  verify_sign?: string;
+  verify_key?: string;
+  error?: string;
+  [key: string]: unknown;
+};
+
+export type IpnPayload = {
+  status?: string;
+  tran_date?: string;
+  tran_id?: string;
+  val_id?: string;
+  amount?: string;
+  store_amount?: string;
+  currency?: string;
+  bank_tran_id?: string;
+  card_type?: string;
+  card_no?: string;
+  card_issuer?: string;
+  card_brand?: string;
+  card_issuer_country?: string;
+  card_issuer_country_code?: string;
+  currency_type?: string;
+  currency_amount?: string;
+  currency_rate?: string;
+  base_fair?: string;
+  value_a?: string;
+  value_b?: string;
+  value_c?: string;
+  value_d?: string;
+  risk_title?: string;
+  risk_level?: string;
+  verify_sign?: string;
+  verify_key?: string;
+  [key: string]: string | undefined;
+};
+
+export type InitSessionParams = {
+  tranId: string;
+  amount: string | number;
+  currency: string;
+  successUrl: string;
+  failUrl: string;
+  cancelUrl: string;
+  ipnUrl: string;
+  product?: {
+    name?: string;
+    category?: string;
+    profile?: string;
+    quantity?: number;
+  };
+  customer?: {
+    name?: string;
+    email?: string;
+    address?: string;
+    city?: string;
+    postcode?: string;
+    country?: string;
+    phone?: string;
+  };
+  shipping?: {
+    method?: string;
+    name?: string;
+    address?: string;
+    city?: string;
+    postcode?: string;
+    country?: string;
+  };
+};
+```
+---
