@@ -647,3 +647,110 @@ export async function validateTransaction(
 
 ```
 ---
+
+#### validations/order.schema.ts
+```bash
+import { z } from "zod";
+
+const decimalStringSchema = z
+  .string()
+  .regex(/^\d+(\.\d{1,2})?$/, "Must be a decimal amount with up to 2 places");
+
+export const createOrderSchema = z.object({
+  productName: z.string().trim().min(1, "Product name is required"),
+  quantity: z.coerce.number().int().positive(),
+  unitPrice: z.union([
+    decimalStringSchema,
+    z.coerce.number().positive().finite(),
+  ]),
+});
+
+export type CreateOrderInput = z.infer<typeof createOrderSchema>;
+
+```
+---
+
+#### validations/payment.schema.ts
+```bash
+import { z } from "zod";
+
+const decimalStringSchema = z
+  .string()
+  .regex(/^\d+(\.\d{1,2})?$/, "Must be a decimal amount with up to 2 places");
+
+const gatewayStatusSchema = z.string().trim().min(1);
+const validGatewayStatusSchema = z.enum(["VALID", "VALIDATED"]);
+
+// Unknown keys are stripped on purpose: callers may send an amount, but the
+// service must only use the server-side Order/Payment amount from the database.
+export const initPaymentSchema = z
+  .object({
+    orderId: z.string().cuid(),
+    idempotencyKey: z.string().trim().min(1).max(255).optional(),
+  })
+  .strip();
+
+export type InitPaymentInput = z.infer<typeof initPaymentSchema>;
+
+export const callbackParamsSchema = z.object({
+  tran_id: z.string().uuid(),
+});
+
+export type CallbackParams = z.infer<typeof callbackParamsSchema>;
+
+export const ipnPayloadSchema = z
+  .object({
+    tran_id: z.string().min(1),
+    val_id: z.string().min(1).optional(),
+    status: gatewayStatusSchema,
+    amount: decimalStringSchema,
+    store_amount: decimalStringSchema.optional(),
+    currency: z.string().min(1),
+    card_type: z.string().min(1).optional(),
+    bank_tran_id: z.string().min(1).optional(),
+  })
+  .passthrough();
+
+export type IpnPayloadInput = z.infer<typeof ipnPayloadSchema>;
+
+export const validationApiResponseSchema = z
+  .object({
+    status: validGatewayStatusSchema,
+    tran_id: z.string().min(1),
+    val_id: z.string().min(1),
+    amount: decimalStringSchema,
+    store_amount: decimalStringSchema.optional(),
+    currency: z.string().min(1),
+    card_type: z.string().min(1).optional(),
+    bank_tran_id: z.string().min(1).optional(),
+  })
+  .passthrough();
+
+export type ValidationApiResponseInput = z.infer<
+  typeof validationApiResponseSchema
+>;
+
+```
+---
+
+#### validations/env.schema.ts
+```bash
+import { z } from "zod";
+
+export const envSchema = z.object({
+  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  SSLCOMMERZ_STORE_ID: z.string().min(1, "SSLCOMMERZ_STORE_ID is required"),
+  SSLCOMMERZ_STORE_PASSWORD: z
+    .string()
+    .min(1, "SSLCOMMERZ_STORE_PASSWORD is required"),
+  SSLCOMMERZ_MODE: z.enum(["sandbox", "live"], {
+    error: "SSLCOMMERZ_MODE must be either 'sandbox' or 'live'",
+  }),
+  LOG_LEVEL: z.string().min(1).default("info"),
+  NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+});
+
+export type Env = z.infer<typeof envSchema>;
+
+```
+---
