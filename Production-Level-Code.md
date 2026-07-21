@@ -485,3 +485,165 @@ export type InitSessionParams = {
 };
 ```
 ---
+
+#### lib/sslcommerz/client.ts
+```bash
+import { env } from "@/lib/env";
+import { log } from "@/lib/logger";
+import type {
+  InitSessionParams,
+  SessionRequestPayload,
+  SessionResponse,
+  ValidationResponse,
+} from "@/lib/sslcommerz/types";
+
+const sslCommerzBaseUrls = {
+  sandbox: "https://sandbox.sslcommerz.com",
+  live: "https://securepay.sslcommerz.com",
+} as const;
+
+function getBaseUrl() {
+  return sslCommerzBaseUrls[env.SSLCOMMERZ_MODE];
+}
+
+function stringifyAmount(amount: string | number) {
+  return typeof amount === "number" ? amount.toFixed(2) : amount;
+}
+
+function redactStorePassword<T extends { store_passwd?: unknown }>(payload: T) {
+  return {
+    ...payload,
+    store_passwd:
+      payload.store_passwd === undefined ? undefined : "[redacted]",
+  };
+}
+
+function toFormBody(payload: SessionRequestPayload) {
+  const body = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(payload)) {
+    if (value !== undefined) {
+      body.set(key, value);
+    }
+  }
+
+  return body;
+}
+
+async function readJsonResponse<T>(response: Response, context: string): Promise<T> {
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `${context} failed with HTTP ${response.status}: ${text || response.statusText}`,
+    );
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`${context} returned invalid JSON`);
+  }
+}
+
+function buildSessionPayload(params: InitSessionParams): SessionRequestPayload {
+  const customer = params.customer ?? {};
+  const shipping = params.shipping ?? {};
+  const product = params.product ?? {};
+
+  return {
+    store_id: env.SSLCOMMERZ_STORE_ID,
+    store_passwd: env.SSLCOMMERZ_STORE_PASSWORD,
+    total_amount: stringifyAmount(params.amount),
+    currency: params.currency,
+    tran_id: params.tranId,
+    success_url: params.successUrl,
+    fail_url: params.failUrl,
+    cancel_url: params.cancelUrl,
+    ipn_url: params.ipnUrl,
+    product_name: product.name ?? "Demo Product",
+    product_category: product.category ?? "General",
+    product_profile: product.profile ?? "general",
+    cus_name: customer.name ?? "Demo Customer",
+    cus_email: customer.email ?? "customer@example.com",
+    cus_add1: customer.address ?? "Dhaka",
+    cus_city: customer.city ?? "Dhaka",
+    cus_postcode: customer.postcode ?? "1207",
+    cus_country: customer.country ?? "Bangladesh",
+    cus_phone: customer.phone ?? "01700000000",
+    shipping_method: shipping.method ?? "NO",
+    num_of_item: String(product.quantity ?? 1),
+    ship_name: shipping.name ?? customer.name ?? "Demo Customer",
+    ship_add1: shipping.address ?? customer.address ?? "Dhaka",
+    ship_city: shipping.city ?? customer.city ?? "Dhaka",
+    ship_postcode: shipping.postcode ?? customer.postcode ?? "1207",
+    ship_country: shipping.country ?? customer.country ?? "Bangladesh",
+  };
+}
+
+export async function initSession(
+  params: InitSessionParams,
+): Promise<SessionResponse> {
+  const endpoint = `${getBaseUrl()}/gwprocess/v4/api.php`;
+  const payload = buildSessionPayload(params);
+
+  log.info(
+    { endpoint, payload: redactStorePassword(payload) },
+    "Calling SSLCommerz session API",
+  );
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: toFormBody(payload),
+  });
+
+  const data = await readJsonResponse<SessionResponse>(
+    response,
+    "SSLCommerz session API",
+  );
+
+  log.info({ endpoint, response: data }, "Received SSLCommerz session response");
+
+  return data;
+}
+
+export async function validateTransaction(
+  valId: string,
+): Promise<ValidationResponse> {
+  const endpoint = new URL(
+    `${getBaseUrl()}/validator/api/validationserverAPI.php`,
+  );
+
+  endpoint.searchParams.set("val_id", valId);
+  endpoint.searchParams.set("store_id", env.SSLCOMMERZ_STORE_ID);
+  endpoint.searchParams.set("store_passwd", env.SSLCOMMERZ_STORE_PASSWORD);
+  endpoint.searchParams.set("v", "1");
+  endpoint.searchParams.set("format", "json");
+
+  log.info(
+    {
+      endpoint: endpoint.origin + endpoint.pathname,
+      query: redactStorePassword(Object.fromEntries(endpoint.searchParams)),
+    },
+    "Calling SSLCommerz validation API",
+  );
+
+  const response = await fetch(endpoint);
+  const data = await readJsonResponse<ValidationResponse>(
+    response,
+    "SSLCommerz validation API",
+  );
+
+  log.info(
+    { endpoint: endpoint.origin + endpoint.pathname, response: data },
+    "Received SSLCommerz validation response",
+  );
+
+  return data;
+}
+
+```
+---
