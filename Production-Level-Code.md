@@ -886,17 +886,18 @@ function updateOrderStatus(
     data: { status },
   });
 }
-
 ```
 ---
 
 #### services/payment.service.ts
 ```bash
-import { OrderStatus, PaymentStatus, Prisma } from "@/app/generated/prisma";
+import { OrderStatus, PaymentStatus, Prisma, WebhookSource } from "@/app/generated/prisma";
 import { env } from "@/lib/env";
 import prisma from "@/lib/prisma";
-import { initSession } from "@/lib/sslcommerz/client";
-import { getOrderWithTotal } from "@/services/order.service";
+import { initSession, validateTransaction } from "@/lib/sslcommerz/client";
+import { getOrderWithTotal, markOrderPaid, markOrderFailed, markOrderCancelled } from "@/services/order.service";
+import { validationApiResponseSchema } from "@/validations/payment.schema";
+import { log } from "@/lib/logger";
 
 export type InitiatePaymentResult = {
   gatewayUrl: string;
@@ -1045,6 +1046,193 @@ export async function initiatePayment(
   return response;
 }
 
+export type ProcessGatewayCallbackResult = {
+  paymentStatus: PaymentStatus | "not_found";
+};
+
+export async function processGatewayCallback(
+  tranId: string,
+  outcome: "success" | "fail" | "cancel",
+  requestId: string,
+  valId?: string,
+): Promise<ProcessGatewayCallbackResult> {
+  const payment = await prisma.payment.findUnique({
+    where: { tranId },
+  });
+
+  if (!payment) {
+    log.warn(
+      { requestId, tranId, outcome },
+      "Gateway callback received for unknown tran_id",
+    );
+    return { paymentStatus: "not_found" };
+  }
+
+  const source = getWebhookSource(outcome);
+
+  if (payment.status === PaymentStatus.SUCCESS || payment.status === PaymentStatus.FAILED) {
+    await prisma.paymentEvent.create({
+      data: {
+        paymentId: payment.id,
+        source,
+        requestId,
+        rawPayload: buildRawCallbackPayload(tranId, outcome, valId),
+        resultStatus: "duplicate_ignored",
+      },
+    });
+
+    log.info(
+      { requestId, paymentId: payment.id, tranId, status: payment.status },
+      "Duplicate gateway callback ignored",
+    );
+
+    return { paymentStatus: payment.status };
+  }
+
+  if (outcome === "cancel") {
+    await prisma.$transaction(async (tx) => {
+      await markOrderCancelled(payment.orderId, tx);
+      await tx.payment.update({
+        where: { id: payment.id },
+        data: { status: PaymentStatus.CANCELLED },
+      });
+    });
+
+    await prisma.paymentEvent.create({
+      data: {
+        paymentId: payment.id,
+        source: WebhookSource.REDIRECT_CANCEL,
+        requestId,
+        rawPayload: buildRawCallbackPayload(tranId, outcome, valId),
+        resultStatus: "cancelled",
+      },
+    });
+
+    log.info(
+      { requestId, paymentId: payment.id, tranId },
+      "Payment cancelled via gateway redirect",
+    );
+
+    return { paymentStatus: PaymentStatus.CANCELLED };
+  }
+
+  let validationResult: unknown = null;
+  let validationSucceeded = false;
+  let amountMatches = false;
+  let currencyMatches = false;
+
+  if (valId) {
+    try {
+      validationResult = await validateTransaction(valId);
+      const parsed = validationApiResponseSchema.safeParse(validationResult);
+
+      if (parsed.success) {
+        const data = parsed.data;
+        validationSucceeded = data.status === "VALID" || data.status === "VALIDATED";
+        amountMatches = new Prisma.Decimal(data.amount).equals(payment.amount);
+        currencyMatches = data.currency === payment.currency;
+      }
+    } catch (error) {
+      log.error(
+        { requestId, paymentId: payment.id, tranId, error: serializeError(error) },
+        "Validation API call failed",
+      );
+    }
+  }
+
+  const isSuccess = validationSucceeded && amountMatches && currencyMatches;
+
+  if (isSuccess) {
+    await prisma.$transaction(async (tx) => {
+      await tx.payment.update({
+        where: { id: payment.id },
+        data: { status: PaymentStatus.SUCCESS },
+      });
+      await markOrderPaid(payment.orderId, tx);
+    });
+
+    await prisma.paymentEvent.create({
+      data: {
+        paymentId: payment.id,
+        source,
+        requestId,
+        rawPayload: buildRawCallbackPayload(tranId, outcome, valId),
+        resultStatus: "validated_success",
+      },
+    });
+
+    return { paymentStatus: PaymentStatus.SUCCESS };
+  }
+
+  const failReason = !validationSucceeded
+    ? "validation_failed"
+    : "amount_mismatch";
+
+  await prisma.$transaction(async (tx) => {
+    await tx.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: PaymentStatus.FAILED,
+        failReason,
+      },
+    });
+    await markOrderFailed(payment.orderId, tx);
+  });
+
+  await prisma.paymentEvent.create({
+    data: {
+      paymentId: payment.id,
+      source,
+      requestId,
+      rawPayload: buildRawCallbackPayload(tranId, outcome, valId),
+      resultStatus: failReason,
+    },
+  });
+
+  return { paymentStatus: PaymentStatus.FAILED };
+}
+
+function getWebhookSource(
+  outcome: "success" | "fail" | "cancel",
+): WebhookSource {
+  switch (outcome) {
+    case "success":
+      return WebhookSource.REDIRECT_SUCCESS;
+    case "fail":
+      return WebhookSource.REDIRECT_FAIL;
+    case "cancel":
+      return WebhookSource.REDIRECT_CANCEL;
+    default:
+      return WebhookSource.REDIRECT_FAIL;
+  }
+}
+
+function buildRawCallbackPayload(
+  tranId: string,
+  outcome: string,
+  valId?: string,
+  extra?: Record<string, unknown>,
+): Prisma.InputJsonValue {
+  const payload: Record<string, unknown> = {
+    tran_id: tranId,
+    outcome,
+    ...(valId ? { val_id: valId } : {}),
+    ...extra,
+  };
+  return JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue;
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { error };
+}
+
 function buildCallbackUrls() {
   const appUrl = env.APP_URL.replace(/\/$/, "");
 
@@ -1099,7 +1287,6 @@ function isUniqueConstraintError(error: unknown) {
 function toPrismaJson(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
-
 ```
 ---
 
@@ -1231,6 +1418,217 @@ function serializeError(error: unknown) {
   return { error };
 }
 
+```
+---
+
+#### app/api/payment/success/route.ts
+```bash
+import { NextResponse, type NextRequest } from "next/server";
+import { log } from "@/lib/logger";
+import {
+  processGatewayCallback,
+  type ProcessGatewayCallbackResult,
+} from "@/services/payment.service";
+import { callbackParamsSchema } from "@/validations/payment.schema";
+
+export async function GET(request: NextRequest) {
+  const requestId = crypto.randomUUID();
+  const path = request.nextUrl.pathname;
+  const method = request.method;
+
+  log.info({ requestId, path, method }, "Payment callback received");
+
+  try {
+    const searchParams = request.nextUrl.searchParams;
+    const rawParams = Object.fromEntries(searchParams.entries());
+    const { tran_id } = callbackParamsSchema.parse(rawParams);
+
+    const valId = searchParams.get("val_id") ?? undefined;
+
+    const result = await processGatewayCallback(tran_id, "success", requestId, valId);
+
+    log.info(
+      { requestId, path, method, tranId: tran_id, status: result.paymentStatus },
+      "Payment callback processed",
+    );
+
+    const redirectPath = getRedirectPath(result.paymentStatus);
+    return NextResponse.redirect(new URL(redirectPath, request.url));
+  } catch (error) {
+    log.error(
+      { requestId, path, method, error: serializeError(error) },
+      "Payment callback failed",
+    );
+
+    return NextResponse.redirect(new URL("/checkout/fail", request.url));
+  }
+}
+
+function getRedirectPath(
+  status: ProcessGatewayCallbackResult["paymentStatus"],
+): string {
+  switch (status) {
+    case "SUCCESS":
+      return "/checkout/success";
+    case "CANCELLED":
+      return "/checkout/cancel";
+    case "FAILED":
+    case "not_found":
+    default:
+      return "/checkout/fail";
+  }
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { error };
+}
+```
+---
+
+#### app/api/payment/fail/route.ts
+```bash
+import { NextResponse, type NextRequest } from "next/server";
+import { log } from "@/lib/logger";
+import {
+  processGatewayCallback,
+  type ProcessGatewayCallbackResult,
+} from "@/services/payment.service";
+import { callbackParamsSchema } from "@/validations/payment.schema";
+
+export async function GET(request: NextRequest) {
+  const requestId = crypto.randomUUID();
+  const path = request.nextUrl.pathname;
+  const method = request.method;
+
+  log.info({ requestId, path, method }, "Payment callback received");
+
+  try {
+    const searchParams = request.nextUrl.searchParams;
+    const rawParams = Object.fromEntries(searchParams.entries());
+    const { tran_id } = callbackParamsSchema.parse(rawParams);
+
+    const valId = searchParams.get("val_id") ?? undefined;
+
+    const result = await processGatewayCallback(tran_id, "fail", requestId, valId);
+
+    log.info(
+      { requestId, path, method, tranId: tran_id, status: result.paymentStatus },
+      "Payment callback processed",
+    );
+
+    const redirectPath = getRedirectPath(result.paymentStatus);
+    return NextResponse.redirect(new URL(redirectPath, request.url));
+  } catch (error) {
+    log.error(
+      { requestId, path, method, error: serializeError(error) },
+      "Payment callback failed",
+    );
+
+    return NextResponse.redirect(new URL("/checkout/fail", request.url));
+  }
+}
+
+function getRedirectPath(
+  status: ProcessGatewayCallbackResult["paymentStatus"],
+): string {
+  switch (status) {
+    case "SUCCESS":
+      return "/checkout/success";
+    case "CANCELLED":
+      return "/checkout/cancel";
+    case "FAILED":
+    case "not_found":
+    default:
+      return "/checkout/fail";
+  }
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { error };
+}
+```
+---
+
+#### app/api/payment/cancel/route.ts
+```bash
+import { NextResponse, type NextRequest } from "next/server";
+import { log } from "@/lib/logger";
+import {
+  processGatewayCallback,
+  type ProcessGatewayCallbackResult,
+} from "@/services/payment.service";
+import { callbackParamsSchema } from "@/validations/payment.schema";
+
+export async function GET(request: NextRequest) {
+  const requestId = crypto.randomUUID();
+  const path = request.nextUrl.pathname;
+  const method = request.method;
+
+  log.info({ requestId, path, method }, "Payment callback received");
+
+  try {
+    const searchParams = request.nextUrl.searchParams;
+    const rawParams = Object.fromEntries(searchParams.entries());
+    const { tran_id } = callbackParamsSchema.parse(rawParams);
+
+    const result = await processGatewayCallback(tran_id, "cancel", requestId);
+
+    log.info(
+      { requestId, path, method, tranId: tran_id, status: result.paymentStatus },
+      "Payment callback processed",
+    );
+
+    const redirectPath = getRedirectPath(result.paymentStatus);
+    return NextResponse.redirect(new URL(redirectPath, request.url));
+  } catch (error) {
+    log.error(
+      { requestId, path, method, error: serializeError(error) },
+      "Payment callback failed",
+    );
+
+    return NextResponse.redirect(new URL("/checkout/fail", request.url));
+  }
+}
+
+function getRedirectPath(
+  status: ProcessGatewayCallbackResult["paymentStatus"],
+): string {
+  switch (status) {
+    case "SUCCESS":
+      return "/checkout/success";
+    case "CANCELLED":
+      return "/checkout/cancel";
+    case "FAILED":
+    case "not_found":
+    default:
+      return "/checkout/fail";
+  }
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { error };
+}
 ```
 ---
 
