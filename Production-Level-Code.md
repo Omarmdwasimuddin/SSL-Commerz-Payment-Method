@@ -57,12 +57,194 @@ payment-method/
 
 #### prisma/schema.prisma
 ```bash
+generator client {
+  provider = "prisma-client-js"
+  output   = "../app/generated/prisma"
+}
 
+datasource db {
+  provider = "postgresql"
+}
+
+// --------------------------------------------------------------------------
+// Enums
+// --------------------------------------------------------------------------
+
+enum OrderStatus {
+  PENDING // order created, no successful payment yet
+  PAID // a Payment reached SUCCESS and was validated
+  FAILED // payment attempt(s) failed, order not fulfilled
+  CANCELLED // user cancelled before/during payment
+}
+
+enum PaymentGateway {
+  SSLCOMMERZ
+  // add more here later (BKASH, STRIPE, etc.) if the project ever expands
+}
+
+enum PaymentStatus {
+  INITIATED // session created with gateway, user not redirected/paid yet
+  PENDING // user redirected to gateway, awaiting callback/IPN
+  SUCCESS // independently verified via Validation API
+  FAILED // gateway or validation reported failure
+  CANCELLED // user cancelled at the gateway
+}
+
+// Where a status-changing signal came from — critical for debugging
+// "why did this payment change state" during a real incident.
+enum WebhookSource {
+  REDIRECT_SUCCESS
+  REDIRECT_FAIL
+  REDIRECT_CANCEL
+  IPN
+  VALIDATION_API // manual/reconciliation re-check
+}
+
+// --------------------------------------------------------------------------
+// Core models
+// --------------------------------------------------------------------------
+
+// Deliberately minimal — this project is not about auth/user management.
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+
+  orders Order[]
+}
+
+model Order {
+  id     String @id @default(cuid())
+  userId String?
+  user   User?  @relation(fields: [userId], references: [id])
+
+  // Decimal, never Float — money must never use floating point.
+  amount   Decimal @db.Decimal(10, 2)
+  currency String  @default("BDT")
+
+  status OrderStatus @default(PENDING)
+
+  items    OrderItem[]
+  payments Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([userId])
+}
+
+// Hardcoded/seeded product data is fine per project scope — the schema
+// still models it properly so the amount-calculation logic is real.
+model OrderItem {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productName String
+  quantity    Int     @default(1)
+  unitPrice   Decimal @db.Decimal(10, 2)
+
+  @@index([orderId])
+}
+
+// The heart of this project. One Order can have multiple Payment attempts
+// (e.g. first attempt failed, user retried) — never overwrite/reuse a row
+// across attempts, always create a new one with a new tran_id.
+model Payment {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id])
+
+  gateway PaymentGateway @default(SSLCOMMERZ)
+
+  // Your own generated transaction id (UUID) — sent to SSLCommerz as tran_id.
+  tranId String @unique
+
+  // Returned by SSLCommerz after a successful transaction; used to call
+  // the Validation API. Nullable because it doesn't exist until the
+  // gateway redirects/IPNs back.
+  valId String? @unique
+
+  sessionKey String? // returned by sessionapi at init time
+  gatewayUrl String? // GatewayPageURL returned at init time
+
+  // Snapshot of amount/currency at the time this Payment was created —
+  // always compared against the live Order total during validation to
+  // catch tampering or race conditions (e.g. order edited mid-payment).
+  amount   Decimal @db.Decimal(10, 2)
+  currency String  @default("BDT")
+
+  status PaymentStatus @default(INITIATED)
+
+  // Useful gateway metadata worth persisting for support/audit purposes.
+  cardType   String?
+  bankTranId String?
+
+  // Full raw responses from SSLCommerz — never discard these. When a
+  // payment dispute happens weeks later, this is what you go back to.
+  rawInitResponse       Json?
+  rawValidationResponse Json?
+
+  failReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events PaymentEvent[]
+
+  @@index([orderId])
+  @@index([status])
+}
+
+// Append-only audit trail of every callback/IPN/validation call this
+// Payment has ever received. This is what makes a payment system
+// debuggable — without it, "what actually happened to this transaction"
+// is unanswerable after the fact.
+model PaymentEvent {
+  id        String  @id @default(cuid())
+  paymentId String
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  source    WebhookSource
+  requestId String? // correlates back to the API route's log lines
+
+  rawPayload Json // exactly what was received, unmodified
+
+  // What this event resulted in, filled in after processing —
+  // e.g. "validated_success", "duplicate_ignored", "amount_mismatch".
+  resultStatus String?
+  processedAt  DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([paymentId])
+  @@index([source])
+}
+
+// Guards POST /api/payment/init against duplicate submissions
+// (double-click, network retry, etc.) producing duplicate Payment rows
+// for the same order/request.
+model IdempotencyKey {
+  id     String  @id @default(cuid())
+  key    String  @unique // e.g. hash of (orderId + userId) or a client-supplied key
+  orderId String?
+
+  // Cache the response so a retried request with the same key gets the
+  // exact same result instead of re-running side effects.
+  responseBody Json?
+
+  createdAt DateTime  @default(now())
+  expiresAt DateTime?
+
+  @@index([expiresAt])
+}
 ```
 
 ---
 
-#### .env
+#### .env.example
 ```bash
 SSLCOMMERZ_STORE_ID=your_store_id
 SSLCOMMERZ_STORE_PASSWORD=your_store_password
