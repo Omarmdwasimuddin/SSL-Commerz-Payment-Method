@@ -336,6 +336,31 @@ export function handlePrismaError(error: unknown): {
 ```
 ---
 
+#### eslint.config.mjs
+```bash
+import { defineConfig, globalIgnores } from "eslint/config";
+import nextVitals from "eslint-config-next/core-web-vitals";
+import nextTs from "eslint-config-next/typescript";
+
+const eslintConfig = defineConfig([
+  ...nextVitals,
+  ...nextTs,
+  // Override default ignores of eslint-config-next.
+  globalIgnores([
+    // Default ignores of eslint-config-next:
+    ".next/**",
+    "out/**",
+    "build/**",
+    "app/generated/prisma/**",
+    "next-env.d.ts",
+  ]),
+]);
+
+export default eslintConfig;
+
+```
+---
+
 #### lib/sslcommerz/types.ts
 ```bash
 type SslCommerzPrimitive = string | number | boolean | null;
