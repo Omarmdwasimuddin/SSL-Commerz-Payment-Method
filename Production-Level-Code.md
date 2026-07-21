@@ -754,3 +754,26 @@ export type Env = z.infer<typeof envSchema>;
 
 ```
 ---
+
+#### lib/env.ts
+```bash
+import "dotenv/config";
+import { z } from "zod";
+import { envSchema } from "@/validations/env.schema";
+
+const parsedEnv = envSchema.safeParse(process.env);
+
+if (!parsedEnv.success) {
+  const missingOrInvalid = z.prettifyError(parsedEnv.error);
+
+  throw new Error(
+    `Invalid environment configuration:\n${missingOrInvalid}`,
+  );
+}
+
+// Import this validated object from server-side code instead of reading
+// process.env directly, so missing payment/database secrets fail at startup.
+export const env = parsedEnv.data;
+
+```
+---
