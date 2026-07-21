@@ -1632,6 +1632,64 @@ function serializeError(error: unknown) {
 ```
 ---
 
+#### app/api/payment/ipn/route.ts
+```bash
+import { NextResponse, type NextRequest } from "next/server";
+import { log } from "@/lib/logger";
+import { processIpn } from "@/services/payment.service";
+
+export async function POST(request: NextRequest) {
+  const requestId = crypto.randomUUID();
+  const path = request.nextUrl.pathname;
+  const method = request.method;
+
+  log.info({ requestId, path, method }, "IPN received");
+
+  try {
+    const rawBody = await request.text();
+    const result = await processIpn(rawBody, requestId);
+
+    log.info(
+      { requestId, path, method, status: result.status },
+      "IPN processed",
+    );
+
+    return NextResponse.json(
+      { status: result.status, requestId },
+      { status: 200 },
+    );
+  } catch (error) {
+    log.error(
+      { requestId, path, method, error: serializeError(error) },
+      "IPN handler failed",
+    );
+
+    return NextResponse.json(
+      { status: "fail", requestId, message: "IPN processing failed" },
+      { status: 200 },
+    );
+  }
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { error };
+}
+```
+---
+
+####
+```bash
+
+```
+---
+
 ####
 ```bash
 
