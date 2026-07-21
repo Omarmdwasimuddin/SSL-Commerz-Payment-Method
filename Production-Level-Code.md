@@ -258,59 +258,355 @@ export type IpnPayloadInput = z.infer<typeof ipnPayloadSchema>;
 
 #### lib/services/sslcommerz.service.ts
 ```bash
+import { z } from "zod";
 import { log } from "@/lib/logger";
 
-interface SSLCommerzInitResponse {
-    status: "SUCCESS" | "FAILED";
-    failedreason?: string;
-    sessionkey?: string;
-    GatewayPageURL?: string;
-    [key: string]: unknown;
+/* ------------------------------------------------------------------ *
+ * Constants
+ * ------------------------------------------------------------------ */
+
+const GATEWAY_STATUS = {
+    SUCCESS: "SUCCESS",
+    FAILED: "FAILED",
+} as const;
+
+const VALIDATION_STATUS = {
+    VALID: "VALID",
+    VALIDATED: "VALIDATED",
+    INVALID_TRANSACTION: "INVALID_TRANSACTION",
+    FAILED: "FAILED",
+    EXPIRED: "EXPIRED",
+} as const;
+
+const DEFAULTS = {
+    COUNTRY: "Bangladesh",
+    POSTCODE: "1000",
+    SHIPPING_METHOD: "NO",
+    NUM_OF_ITEM: "1",
+    PRODUCT_CATEGORY: "E-commerce",
+    PRODUCT_PROFILE: "general",
+    AMOUNT_EPSILON: 0.01,
+} as const;
+
+const HTTP = {
+    INIT_TIMEOUT_MS: 10_000,
+    VALIDATE_TIMEOUT_MS: 10_000,
+    MAX_RETRIES: 2, // total attempts = MAX_RETRIES + 1
+    BASE_BACKOFF_MS: 300,
+} as const;
+
+const GATEWAY_PATHS = {
+    INIT: "/gwprocess/v4/api.php",
+    VALIDATE: "/validator/api/validationserverAPI.php",
+} as const;
+
+/* ------------------------------------------------------------------ *
+ * Errors
+ *
+ * Distinct classes let callers (API routes) branch on `instanceof`
+ * instead of parsing message strings, and each carries only
+ * non-sensitive context that is safe to log or return to a client.
+ * ------------------------------------------------------------------ */
+
+export class ConfigurationError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "ConfigurationError";
+    }
 }
 
-interface SSLCommerzValidationResponse {
-    status: "VALID" | "VALIDATED" | "INVALID_TRANSACTION" | "FAILED" | string;
-    val_id?: string;
-    amount?: string;
-    store_amount?: string;
-    currency_amount?: string;
-    bank_tran_id?: string;
-    card_type?: string;
-    card_issuer?: string;
-    [key: string]: unknown;
+export class NetworkError extends Error {
+    constructor(message: string, options?: { cause?: unknown }) {
+        super(message, options);
+        this.name = "NetworkError";
+    }
 }
 
-// FIXED: age address1/postcode/country chilo, kintu Order model-e shudhu
-// customerAddress ar customerCity ache — interface-ta match kore chotto kora hoise
-interface CustomerInfo {
-    name: string;
-    email: string;
-    phone: string;
-    address?: string;
-    city?: string;
+export class TimeoutError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "TimeoutError";
+    }
 }
 
-// FIXED: productCategory/productProfile Order/Product kono model-e nai bole
-// bad kora hoise — function-er ভিতরে hardcode kora hocche
-interface OrderInfo {
-    tranId: string;
-    amount: number;
-    currency: string;
-    productName: string;
+export class PaymentGatewayError extends Error {
+    readonly httpStatus?: number;
+    readonly gatewayReason?: string;
+
+    constructor(message: string, options?: { httpStatus?: number; gatewayReason?: string; cause?: unknown }) {
+        super(message, { cause: options?.cause });
+        this.name = "PaymentGatewayError";
+        this.httpStatus = options?.httpStatus;
+        this.gatewayReason = options?.gatewayReason;
+    }
 }
 
-function getEnvConfig() {
+export class PaymentValidationError extends Error {
+    readonly reason: string;
+
+    constructor(message: string, reason: string) {
+        super(message);
+        this.name = "PaymentValidationError";
+        this.reason = reason;
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Types
+ * ------------------------------------------------------------------ */
+
+export interface CustomerInfo {
+    readonly name: string;
+    readonly email: string;
+    readonly phone: string;
+    readonly address?: string;
+    readonly city?: string;
+}
+
+export interface OrderInfo {
+    readonly tranId: string;
+    readonly amount: number;
+    readonly currency: string;
+    readonly productName: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Response schemas
+ *
+ * SSLCommerz is an external, untrusted boundary. Every field we rely
+ * on downstream is parsed with Zod so malformed/unexpected payloads
+ * fail fast instead of silently propagating `undefined` into payment
+ * logic. Unknown extra fields are tolerated (`.passthrough()`-free —
+ * we deliberately only declare what we use).
+ * ------------------------------------------------------------------ */
+
+const initResponseSchema = z.object({
+    status: z.enum([GATEWAY_STATUS.SUCCESS, GATEWAY_STATUS.FAILED]),
+    failedreason: z.string().optional(),
+    sessionkey: z.string().optional(),
+    GatewayPageURL: z.string().url().optional(),
+});
+
+export type SSLCommerzInitResponse = z.infer<typeof initResponseSchema>;
+
+const validationResponseSchema = z.object({
+    status: z.string(), // gateway uses a wider, less stable set here than init
+    val_id: z.string().optional(),
+    tran_id: z.string().optional(),
+    amount: z.string().optional(),
+    store_amount: z.string().optional(),
+    currency_amount: z.string().optional(),
+    currency_type: z.string().optional(),
+    bank_tran_id: z.string().optional(),
+    card_type: z.string().optional(),
+    card_issuer: z.string().optional(),
+});
+
+export type SSLCommerzValidationResponse = z.infer<typeof validationResponseSchema>;
+
+function parseGatewayResponse<T>(schema: z.ZodType<T>, raw: unknown, context: { tranId?: string; valId?: string }): T {
+    const result = schema.safeParse(raw);
+    if (!result.success) {
+        log.error(
+            {
+            ...context,
+            issues: result.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+        },
+        "SSLCommerz response failed schema validation"
+    );
+        throw new PaymentGatewayError("SSLCommerz returned an unexpected response shape", {
+            gatewayReason: "SCHEMA_VALIDATION_FAILED",
+        });
+    }
+    return result.data;
+}
+
+/* ------------------------------------------------------------------ *
+ * Configuration
+ *
+ * Read and validate env vars once per call site instead of scattering
+ * `process.env.X` (and its associated "did we check for undefined?"
+ * question) throughout the file. Values are never logged.
+ * ------------------------------------------------------------------ */
+
+interface GatewayConfig {
+    readonly storeId: string;
+    readonly storePassword: string;
+    readonly apiBaseUrl: string;
+    readonly appUrl: string;
+}
+
+function getGatewayConfig(): GatewayConfig {
     const storeId = process.env.SSLCOMMERZ_STORE_ID;
     const storePassword = process.env.SSLCOMMERZ_STORE_PASSWORD;
     const apiBaseUrl = process.env.SSLCOMMERZ_API_BASE_URL;
     const appUrl = process.env.APP_URL;
 
-    if (!storeId || !storePassword) throw new Error("SSLCommerz credentials missing");
-    if (!apiBaseUrl) throw new Error("SSLCOMMERZ_API_BASE_URL missing");
-    if (!appUrl) throw new Error("APP_URL missing");
+    const missing: string[] = [];
+    if (!storeId) missing.push("SSLCOMMERZ_STORE_ID");
+    if (!storePassword) missing.push("SSLCOMMERZ_STORE_PASSWORD");
+    if (!apiBaseUrl) missing.push("SSLCOMMERZ_API_BASE_URL");
+    if (!appUrl) missing.push("APP_URL");
 
-    return { storeId, storePassword, apiBaseUrl, appUrl };
+    if (missing.length > 0) {
+        // Names of missing vars are safe to log; their values never are.
+        throw new ConfigurationError(`Missing required environment variables: ${missing.join(", ")}`);
+    }
+
+    // Fail fast on an SSRF-adjacent misconfiguration: a base URL that
+    // isn't actually a URL would otherwise surface as a confusing
+    // fetch-time TypeError deep inside createGatewayUrl().
+    try {
+        new URL(apiBaseUrl!);
+    } catch {
+        throw new ConfigurationError("SSLCOMMERZ_API_BASE_URL is not a valid URL");
+    }
+
+    return { storeId: storeId!, storePassword: storePassword!, apiBaseUrl: apiBaseUrl!, appUrl: appUrl! };
 }
+
+/**
+ * Builds a gateway URL via the URL class rather than string
+ * concatenation, so a trailing/missing slash in the env var can never
+ * produce a malformed or unexpectedly-redirected request.
+ */
+function createGatewayUrl(base: string, path: string, params?: URLSearchParams): string {
+    const url = new URL(path, base.endsWith("/") ? base : `${base}/`);
+    if (params) url.search = params.toString();
+    return url.toString();
+}
+
+/* ------------------------------------------------------------------ *
+ * HTTP helper: timeout + retry with exponential backoff
+ *
+ * Retries are limited to network-level failures and 5xx responses —
+ * conditions where re-sending the *same* request is safe. 4xx
+ * responses (bad request, auth) and successful HTTP responses with a
+ * gateway-level failure are NOT retried, since retrying those either
+ * can't succeed or risks duplicate payment-initiation side effects.
+ * ------------------------------------------------------------------ */
+
+interface FetchWithRetryOptions {
+    readonly timeoutMs: number;
+    readonly maxRetries: number;
+    readonly context: Record<string, unknown>;
+}
+
+function isRetryableStatus(status: number): boolean {
+    return status >= 500 && status < 600;
+}
+
+async function fetchWithRetry(input: string, init: RequestInit, options: FetchWithRetryOptions): Promise<Response> {
+    const { timeoutMs, maxRetries, context } = options;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+        try {
+            const response = await fetch(input, { ...init, signal: controller.signal });
+            clearTimeout(timeout);
+
+            if (isRetryableStatus(response.status) && attempt < maxRetries) {
+                log.warn(
+                    { 
+                        ...context, 
+                        attempt, 
+                        httpStatus: 
+                        response.status 
+                    },
+                    "SSLCommerz request returned retryable status"
+                );
+                await backoff(attempt);
+                continue;
+            }
+
+            return response;
+        } catch (err) {
+            clearTimeout(timeout);
+            lastError = err;
+
+            const timedOut = err instanceof Error && err.name === "AbortError";
+            if (timedOut) {
+                log.warn(
+                    { 
+                        ...context, 
+                        attempt, 
+                        timeoutMs
+                     },
+                     "SSLCommerz request timed out"
+                );
+            } else {
+                log.warn(
+                    { 
+                        ...context, 
+                        attempt, 
+                        error: (err as Error)?.message 
+                    },
+                    "SSLCommerz request network error"
+                );
+            }
+
+            if (attempt < maxRetries) {
+                await backoff(attempt);
+                continue;
+            }
+
+            if (timedOut) {
+                throw new TimeoutError(`SSLCommerz request timed out after ${maxRetries + 1} attempt(s)`);
+            }
+            throw new NetworkError(`SSLCommerz request failed after ${maxRetries + 1} attempt(s)`, { cause: err });
+        }
+    }
+
+    // Unreachable, but keeps TypeScript's control-flow analysis happy.
+    throw new NetworkError("SSLCommerz request failed", { cause: lastError });
+}
+
+function backoff(attempt: number): Promise<void> {
+    const delay = HTTP.BASE_BACKOFF_MS * 2 ** attempt;
+    return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+/* ------------------------------------------------------------------ *
+ * Request builders
+ * ------------------------------------------------------------------ */
+
+function buildInitFormData(config: GatewayConfig, order: OrderInfo, customer: CustomerInfo): FormData {
+    const formData = new FormData();
+
+    formData.append("store_id", config.storeId);
+    formData.append("store_passwd", config.storePassword);
+    formData.append("total_amount", order.amount.toString());
+    formData.append("currency", order.currency);
+    formData.append("tran_id", order.tranId);
+
+    formData.append("success_url", createGatewayUrl(config.appUrl, "/api/payment/success"));
+    formData.append("fail_url", createGatewayUrl(config.appUrl, "/api/payment/fail"));
+    formData.append("cancel_url", createGatewayUrl(config.appUrl, "/api/payment/cancel"));
+    formData.append("ipn_url", createGatewayUrl(config.appUrl, "/api/payment/ipn"));
+
+    formData.append("cus_name", customer.name);
+    formData.append("cus_email", customer.email);
+    formData.append("cus_add1", customer.address || "N/A");
+    formData.append("cus_city", customer.city || "N/A");
+    formData.append("cus_postcode", DEFAULTS.POSTCODE);
+    formData.append("cus_country", DEFAULTS.COUNTRY);
+    formData.append("cus_phone", customer.phone);
+
+    formData.append("shipping_method", DEFAULTS.SHIPPING_METHOD);
+    formData.append("num_of_item", DEFAULTS.NUM_OF_ITEM);
+    formData.append("product_name", order.productName);
+    formData.append("product_category", DEFAULTS.PRODUCT_CATEGORY);
+    formData.append("product_profile", DEFAULTS.PRODUCT_PROFILE);
+
+    return formData;
+}
+
+/* ------------------------------------------------------------------ *
+ * Public API
+ * ------------------------------------------------------------------ */
 
 export function generateTranId(): string {
     const random = Math.random().toString(36).substring(2, 10).toUpperCase();
@@ -318,68 +614,129 @@ export function generateTranId(): string {
 }
 
 export async function initiatePayment(order: OrderInfo, customer: CustomerInfo): Promise<SSLCommerzInitResponse> {
-    const { storeId, storePassword, apiBaseUrl, appUrl } = getEnvConfig();
+    const config = getGatewayConfig();
+    const formData = buildInitFormData(config, order, customer);
+    const url = createGatewayUrl(config.apiBaseUrl, GATEWAY_PATHS.INIT);
 
-    const formData = new FormData();
-    formData.append("store_id", storeId);
-    formData.append("store_passwd", storePassword);
-    formData.append("total_amount", order.amount.toString());
-    formData.append("currency", order.currency);
-    formData.append("tran_id", order.tranId);
-
-    formData.append("success_url", `${appUrl}/api/payment/success`);
-    formData.append("fail_url", `${appUrl}/api/payment/fail`);
-    formData.append("cancel_url", `${appUrl}/api/payment/cancel`);
-    formData.append("ipn_url", `${appUrl}/api/payment/ipn`);
-
-    formData.append("cus_name", customer.name);
-    formData.append("cus_email", customer.email);
-    formData.append("cus_add1", customer.address || "N/A");
-    formData.append("cus_city", customer.city || "N/A");
-    formData.append("cus_postcode", "1000");
-    formData.append("cus_country", "Bangladesh");
-    formData.append("cus_phone", customer.phone);
-
-    formData.append("shipping_method", "NO");
-    formData.append("num_of_item", "1");
-    formData.append("product_name", order.productName);
-    formData.append("product_category", "E-commerce");
-    formData.append("product_profile", "general");
-
-    const response = await fetch(`${apiBaseUrl}/gwprocess/v4/api.php`, { method: "POST", body: formData });
+    const response = await fetchWithRetry(
+        url,
+        { method: "POST", body: formData },
+        { timeoutMs: HTTP.INIT_TIMEOUT_MS, maxRetries: HTTP.MAX_RETRIES, context: { tranId: order.tranId, op: "initiatePayment" } },
+    );
 
     if (!response.ok) {
-        log.error("SSLCommerz init HTTP error", { httpStatus: response.status, tranId: order.tranId });
-        throw new Error(`SSLCommerz init failed with HTTP ${response.status}`);
+        log.error(
+            { 
+                tranId: order.tranId, 
+                httpStatus: response.status 
+            },
+            "SSLCommerz init HTTP error"
+        );
+        throw new PaymentGatewayError(`SSLCommerz init failed with HTTP ${response.status}`, { httpStatus: response.status });
     }
 
-    const data = (await response.json()) as SSLCommerzInitResponse;
-    if (data.status !== "SUCCESS" || !data.GatewayPageURL) {
-        log.warn("SSLCommerz init non-success", { tranId: order.tranId, reason: data.failedreason });
+    const raw = await response.json();
+    const data = parseGatewayResponse(initResponseSchema, raw, { tranId: order.tranId });
+
+    if (data.status !== GATEWAY_STATUS.SUCCESS || !data.GatewayPageURL) {
+        // Not thrown here: callers that only need the raw gateway
+        // response (e.g. to show the user a specific failure reason)
+        // still get it. Business-layer code decides whether a
+        // non-success init should become a hard error.
+        log.warn(
+            { 
+                tranId: order.tranId, 
+                gatewayStatus: data.status, 
+                reason: data.failedreason 
+            },
+            "SSLCommerz init non-success"
+        );
     }
+
     return data;
 }
 
 export async function validateTransaction(valId: string): Promise<SSLCommerzValidationResponse> {
-    const { storeId, storePassword, apiBaseUrl } = getEnvConfig();
+    if (!valId) {
+        throw new PaymentValidationError("val_id is required", "MISSING_VAL_ID");
+    }
 
-    const params = new URLSearchParams({ val_id: valId, store_id: storeId, store_passwd: storePassword, format: "json" });
-    const response = await fetch(`${apiBaseUrl}/validator/api/validationserverAPI.php?${params}`, { method: "GET" });
+    const config = getGatewayConfig();
+    const params = new URLSearchParams({
+        val_id: valId,
+        store_id: config.storeId,
+        store_passwd: config.storePassword,
+        format: "json",
+    });
+    const url = createGatewayUrl(config.apiBaseUrl, GATEWAY_PATHS.VALIDATE, params);
+
+    const response = await fetchWithRetry(
+        url,
+        { method: "GET" },
+        { timeoutMs: HTTP.VALIDATE_TIMEOUT_MS, maxRetries: HTTP.MAX_RETRIES, context: { valId, op: "validateTransaction" } },
+    );
 
     if (!response.ok) {
-        log.error("SSLCommerz validation HTTP error", { httpStatus: response.status, valId });
-        throw new Error(`Validation request failed with HTTP ${response.status}`);
+        log.error(
+            { 
+                valId, 
+                httpStatus: response.status 
+            },
+            "SSLCommerz validation HTTP error"
+        );
+        throw new PaymentGatewayError(`SSLCommerz validation failed with HTTP ${response.status}`, { httpStatus: response.status });
     }
-    return (await response.json()) as SSLCommerzValidationResponse;
-}
 
-export function isValidationAmountMatching(validation: SSLCommerzValidationResponse, expectedAmount: number): boolean {
-    const receivedAmount = parseFloat(validation.currency_amount ?? validation.amount ?? "0");
-    return Math.abs(receivedAmount - expectedAmount) < 0.01;
+    const raw = await response.json();
+    return parseGatewayResponse(validationResponseSchema, raw, { valId });
 }
 
 export function isValidationStatusSuccess(validation: SSLCommerzValidationResponse): boolean {
-    return validation.status === "VALID" || validation.status === "VALIDATED";
+    return validation.status === VALIDATION_STATUS.VALID || validation.status === VALIDATION_STATUS.VALIDATED;
+}
+
+export function isValidationAmountMatching(validation: SSLCommerzValidationResponse, expectedAmount: number): boolean {
+    const raw = validation.currency_amount ?? validation.amount;
+    if (!raw) return false;
+
+    const receivedAmount = Number(raw);
+    if (!Number.isFinite(receivedAmount)) return false;
+
+    return Math.abs(receivedAmount - expectedAmount) < DEFAULTS.AMOUNT_EPSILON;
+}
+
+/**
+ * Full defensive check for a validated transaction: status, amount,
+ * transaction id, and (when the caller has it) currency all have to
+ * agree with what was recorded at order-creation time. Use this
+ * instead of `isValidationStatusSuccess` alone before marking an
+ * order as paid — status success on its own does not prove the
+ * amount or tran_id line up, which is what makes payment tampering
+ * (a forged success callback for a different/cheaper order) possible.
+ */
+export function assertPaymentIsLegitimate(
+    validation: SSLCommerzValidationResponse,
+    expected: { tranId: string; amount: number; currency?: string },
+): void {
+    if (!isValidationStatusSuccess(validation)) {
+        throw new PaymentValidationError("Transaction status is not valid", "STATUS_NOT_VALID");
+    }
+
+    if (validation.tran_id && validation.tran_id !== expected.tranId) {
+        throw new PaymentValidationError("Transaction id mismatch", "TRAN_ID_MISMATCH");
+    }
+
+    if (!isValidationAmountMatching(validation, expected.amount)) {
+        throw new PaymentValidationError("Transaction amount mismatch", "AMOUNT_MISMATCH");
+    }
+
+    if (expected.currency && validation.currency_type && validation.currency_type !== expected.currency) {
+        throw new PaymentValidationError("Transaction currency mismatch", "CURRENCY_MISMATCH");
+    }
+
+    if (!validation.val_id) {
+        throw new PaymentValidationError("Missing val_id on validated transaction", "MISSING_VAL_ID");
+    }
 }
 ```
 
