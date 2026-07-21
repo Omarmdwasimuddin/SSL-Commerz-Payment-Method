@@ -802,3 +802,96 @@ export const env = parsedEnv.data;
 
 ```
 ---
+
+#### services/order.service.ts
+```bash
+import { OrderStatus, Prisma } from "@/app/generated/prisma";
+import prisma from "@/lib/prisma";
+import {
+  createOrderSchema,
+  type CreateOrderInput,
+} from "@/validations/order.schema";
+
+type OrderDbClient = typeof prisma | Prisma.TransactionClient;
+
+export async function createOrder(input: CreateOrderInput) {
+  const parsed = createOrderSchema.parse(input);
+  const unitPrice = new Prisma.Decimal(parsed.unitPrice);
+  const amount = unitPrice.mul(parsed.quantity);
+
+  return prisma.order.create({
+    data: {
+      amount,
+      status: OrderStatus.PENDING,
+      items: {
+        create: {
+          productName: parsed.productName,
+          quantity: parsed.quantity,
+          unitPrice,
+        },
+      },
+    },
+    include: {
+      items: true,
+    },
+  });
+}
+
+export async function getOrderWithTotal(orderId: string) {
+  const order = await prisma.order.findUniqueOrThrow({
+    where: { id: orderId },
+    include: {
+      items: true,
+    },
+  });
+
+  const total = order.items.reduce(
+    (sum, item) => sum.plus(item.unitPrice.mul(item.quantity)),
+    new Prisma.Decimal(0),
+  );
+
+  return { order, total };
+}
+
+export async function markOrderPaid(
+  orderId: string,
+  tx?: Prisma.TransactionClient,
+) {
+  return updateOrderStatus(orderId, OrderStatus.PAID, tx);
+}
+
+export async function markOrderFailed(
+  orderId: string,
+  tx?: Prisma.TransactionClient,
+) {
+  return updateOrderStatus(orderId, OrderStatus.FAILED, tx);
+}
+
+export async function markOrderCancelled(
+  orderId: string,
+  tx?: Prisma.TransactionClient,
+) {
+  return updateOrderStatus(orderId, OrderStatus.CANCELLED, tx);
+}
+
+function updateOrderStatus(
+  orderId: string,
+  status: OrderStatus,
+  tx?: Prisma.TransactionClient,
+) {
+  const db: OrderDbClient = tx ?? prisma;
+
+  return db.order.update({
+    where: { id: orderId },
+    data: { status },
+  });
+}
+
+```
+---
+
+####
+```bash
+
+```
+---
