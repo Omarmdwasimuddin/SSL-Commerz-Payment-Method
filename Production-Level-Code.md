@@ -771,12 +771,13 @@ export const envSchema = z.object({
   SSLCOMMERZ_MODE: z.enum(["sandbox", "live"], {
     error: "SSLCOMMERZ_MODE must be either 'sandbox' or 'live'",
   }),
+  APP_URL: z.url("APP_URL must be a valid absolute URL"),
   LOG_LEVEL: z.string().min(1).default("info"),
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+  RECONCILIATION_SECRET: z.string().min(1, "RECONCILIATION_SECRET is required"),
 });
 
 export type Env = z.infer<typeof envSchema>;
-
 ```
 ---
 
