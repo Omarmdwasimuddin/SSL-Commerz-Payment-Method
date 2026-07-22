@@ -1301,46 +1301,44 @@ function buildRawCallbackPayload(
   return JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue;
 }
 
+async function applyAtomicUpdate(
+  payment: { id: string; orderId: string },
+  status: PaymentStatus,
+  failReason: string,
+): Promise<ApplyValidationResult> {
+  const result = await prisma.$transaction(async (tx) => {
+    const updateResult = await tx.payment.updateMany({
+      where: { id: payment.id, status: { notIn: TERMINAL_PAYMENT_STATUSES } },
+      data: { status, failReason },
+    });
+
+    if (updateResult.count === 0) {
+      return { raced: true };
+    }
+
+    if (status === PaymentStatus.SUCCESS) {
+      await markOrderPaid(payment.orderId, tx);
+    } else {
+      await markOrderFailed(payment.orderId, tx);
+    }
+
+    return { raced: false };
+  });
+
+  if (result.raced) {
+    return { paymentStatus: status, failReason: "duplicate_ignored" };
+  }
+
+  return { paymentStatus: status, failReason };
+}
+
 async function applyValidationOutcome(
   payment: { id: string; orderId: string; amount: Prisma.Decimal; currency: string; status: PaymentStatus },
   valId: string | undefined,
   requestId: string,
 ): Promise<ApplyValidationResult> {
-  const terminalStatuses = TERMINAL_PAYMENT_STATUSES;
-
-  const performAtomicUpdate = async (
-    status: PaymentStatus,
-    failReason: string,
-  ): Promise<ApplyValidationResult> => {
-    // Atomic update with race guard inside transaction
-    const result = await prisma.$transaction(async (tx) => {
-      const updateResult = await tx.payment.updateMany({
-        where: { id: payment.id, status: { notIn: terminalStatuses } },
-        data: { status, failReason },
-      });
-
-      if (updateResult.count === 0) {
-        return { raced: true };
-      }
-
-      if (status === PaymentStatus.SUCCESS) {
-        await markOrderPaid(payment.orderId, tx);
-      } else {
-        await markOrderFailed(payment.orderId, tx);
-      }
-
-      return { raced: false };
-    });
-
-    if (result.raced) {
-      return { paymentStatus: status, failReason: "duplicate_ignored" };
-    }
-
-    return { paymentStatus: status, failReason };
-  };
-
   if (!valId) {
-    return performAtomicUpdate(PaymentStatus.FAILED, "validation_failed");
+    return applyAtomicUpdate(payment, PaymentStatus.FAILED, "validation_failed");
   }
 
   let validationResult: unknown = null;
@@ -1355,7 +1353,7 @@ async function applyValidationOutcome(
 
   const parsed = validationApiResponseSchema.safeParse(validationResult);
   if (!parsed.success) {
-    return performAtomicUpdate(PaymentStatus.FAILED, "validation_failed");
+    return applyAtomicUpdate(payment, PaymentStatus.FAILED, "validation_failed");
   }
 
   const data = parsed.data;
@@ -1364,11 +1362,78 @@ async function applyValidationOutcome(
   const currencyMatches = data.currency === payment.currency;
 
   if (isValid && amountMatches && currencyMatches) {
-    return performAtomicUpdate(PaymentStatus.SUCCESS, "validated_success");
+    return applyAtomicUpdate(payment, PaymentStatus.SUCCESS, "validated_success");
   }
 
   const failReason = !isValid ? "validation_failed" : "amount_mismatch";
-  return performAtomicUpdate(PaymentStatus.FAILED, failReason);
+  return applyAtomicUpdate(payment, PaymentStatus.FAILED, failReason);
+}
+
+export type ReconcileSummary = {
+  checked: number;
+  success: number;
+  failed: number;
+  unresolved: number;
+};
+
+export async function reconcileStuckPayments(
+  olderThanMinutes: number = 30,
+  limit: number = 100,
+): Promise<ReconcileSummary> {
+  olderThanMinutes = Math.max(5, Math.min(1440, olderThanMinutes));
+  limit = Math.max(1, Math.min(100, limit));
+
+  const cutoffDate = new Date(Date.now() - olderThanMinutes * 60_000);
+  const noValIdCutoff = new Date(Date.now() - olderThanMinutes * 2 * 60_000);
+
+  const stuckPayments = await prisma.payment.findMany({
+    where: {
+      status: { in: [PaymentStatus.INITIATED, PaymentStatus.PENDING] },
+      createdAt: { lt: cutoffDate },
+    },
+    take: limit,
+    orderBy: { createdAt: "asc" },
+  });
+
+  let checked = 0;
+  let success = 0;
+  let failed = 0;
+  let unresolved = 0;
+
+  for (const payment of stuckPayments) {
+    checked++;
+
+    if (payment.valId) {
+      const result = await applyValidationOutcome(
+        payment,
+        payment.valId,
+        crypto.randomUUID(),
+      );
+      if (result.paymentStatus === PaymentStatus.SUCCESS) success++;
+      else if (result.paymentStatus === PaymentStatus.FAILED) failed++;
+      else unresolved++;
+    } else {
+      // No valId means the user never completed the gateway checkout,
+      // so the Validation API has nothing to validate. But some late
+      // redirects or IPNs may still deliver valId, so we only auto-fail
+      // payments that crossed a 2x timeout threshold. This gives the
+      // async callback pipeline time to resolve the payment before
+      // reconciliation declares it abandoned.
+      if (payment.createdAt < noValIdCutoff) {
+        const result = await applyAtomicUpdate(
+          payment,
+          PaymentStatus.FAILED,
+          "no_val_id_stuck",
+        );
+        if (result.paymentStatus === PaymentStatus.FAILED) failed++;
+        else unresolved++;
+      } else {
+        unresolved++;
+      }
+    }
+  }
+
+  return { checked, success, failed, unresolved };
 }
 
 function serializeError(error: unknown) {
