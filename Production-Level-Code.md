@@ -246,14 +246,24 @@ model IdempotencyKey {
 
 #### .env.example
 ```bash
-SSLCOMMERZ_STORE_ID=your_store_id
-SSLCOMMERZ_STORE_PASSWORD=your_store_password
+# Connect to Postgres via the shared transaction-mode pooler (IPv4-only)
+DATABASE_URL=""
 
-# sandbox: https://sandbox.sslcommerz.com
-# live:    https://securepay.sslcommerz.com
+# Connect to Postgres via the shared session-mode pooler (used for migrations)
+DIRECT_URL=""
+
+
+// Sandbox Store ID
+SSLCOMMERZ_STORE_ID=
+SSLCOMMERZ_STORE_PASSWORD=
 SSLCOMMERZ_API_BASE_URL=https://sandbox.sslcommerz.com
-
 APP_URL=http://localhost:3000
+RECONCILIATION_SECRET=dev-secret-change-me
+SSLCOMMERZ_MODE=live
+
+
+LOG_LEVEL=debug
+NODE_ENV=production
 ```
 
 ---
