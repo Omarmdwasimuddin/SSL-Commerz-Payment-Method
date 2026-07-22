@@ -1891,9 +1891,102 @@ function serializeError(error: unknown) {
 ```
 ---
 
-####
+#### app/api/payment/reconcile/route.ts
 ```bash
+import { NextResponse, type NextRequest } from "next/server";
+import { timingSafeEqual } from "crypto";
+import { log } from "@/lib/logger";
+import { env } from "@/lib/env";
+import { reconcileStuckPayments } from "@/services/payment.service";
+import { reconcileSchema } from "@/validations/payment.schema";
 
+export async function GET(request: NextRequest) {
+  const requestId = crypto.randomUUID();
+  const path = request.nextUrl.pathname;
+  const method = request.method;
+
+  log.info({ requestId, path, method }, "Reconciliation request received");
+
+  const secret = request.headers.get("x-reconcile-secret");
+  const expected = Buffer.from(env.RECONCILIATION_SECRET);
+  const provided = Buffer.from(secret ?? "");
+
+  const maxLength = Math.max(expected.length, provided.length);
+  const expectedPadded = Buffer.alloc(maxLength);
+  expected.copy(expectedPadded);
+  const providedPadded = Buffer.alloc(maxLength);
+  provided.copy(providedPadded);
+
+  let isMatch = false;
+  try {
+    isMatch = timingSafeEqual(expectedPadded, providedPadded);
+  } catch {
+    // Swallow unexpected errors from timingSafeEqual.
+  }
+
+  if (!isMatch) {
+    log.warn({ requestId, path, method }, "Reconciliation unauthorized");
+    return NextResponse.json(
+      {
+        status: "fail",
+        requestId,
+        message: "Unauthorized",
+      },
+      { status: 401 },
+    );
+  }
+
+  try {
+    const params = {
+      olderThanMinutes: Number(request.nextUrl.searchParams.get("olderThanMinutes") ?? 30),
+      limit: Number(request.nextUrl.searchParams.get("limit") ?? 100),
+    };
+
+    const parsed = reconcileSchema.parse(params);
+
+    const summary = await reconcileStuckPayments(
+      parsed.olderThanMinutes,
+      parsed.limit,
+    );
+
+    log.info(
+      { requestId, path, method, summary },
+      "Reconciliation completed",
+    );
+
+    return NextResponse.json({
+      status: "success",
+      requestId,
+      message: "Reconciliation completed",
+      data: summary,
+    });
+  } catch (error) {
+    log.error(
+      { requestId, path, method, error: serializeError(error) },
+      "Reconciliation failed",
+    );
+
+    return NextResponse.json(
+      {
+        status: "fail",
+        requestId,
+        message: "Reconciliation failed",
+      },
+      { status: 500 },
+    );
+  }
+}
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { error };
+}
 ```
 ---
 
