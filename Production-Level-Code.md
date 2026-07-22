@@ -1436,6 +1436,40 @@ export async function reconcileStuckPayments(
   return { checked, success, failed, unresolved };
 }
 
+export async function getPaymentWithOrder(tranId: string) {
+  const payment = await prisma.payment.findUnique({
+    where: { tranId },
+    include: {
+      order: {
+        select: {
+          id: true,
+          amount: true,
+          currency: true,
+          status: true,
+          items: {
+            select: {
+              productName: true,
+            },
+            take: 1,
+          },
+        },
+      },
+    },
+  });
+
+  if (!payment) {
+    return null;
+  }
+
+  return {
+    payment,
+    productName: payment.order.items[0]?.productName ?? "Demo Product",
+    amount: payment.amount,
+    currency: payment.currency,
+    tranId: payment.tranId,
+  };
+}
+
 function serializeError(error: unknown) {
   if (error instanceof Error) {
     return {
@@ -1503,15 +1537,12 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { handlePrismaError } from "@/lib/errors/handlePrismaError";
 import { log } from "@/lib/logger";
+import { checkRateLimit, getClientIp } from "@/lib/rate-limit";
 import {
   initiatePayment,
   PaymentInitError,
 } from "@/services/payment.service";
 import { initPaymentSchema } from "@/validations/payment.schema";
-
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQUESTS = 5;
-const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
 
 export async function POST(request: NextRequest) {
   const requestId = crypto.randomUUID();
@@ -1523,9 +1554,9 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const input = initPaymentSchema.parse(body);
-    const rateLimitKey = getClientIp(request);
+    const rateLimitKey = getClientIp(request.headers);
 
-    if (isRateLimited(rateLimitKey)) {
+    if (checkRateLimit(rateLimitKey)) {
       log.info({ requestId, path, method, rateLimitKey }, "Rate limit exceeded");
 
       return NextResponse.json(
@@ -1570,33 +1601,6 @@ export async function POST(request: NextRequest) {
   }
 }
 
-function isRateLimited(key: string) {
-  const now = Date.now();
-  const bucket = rateLimitBuckets.get(key);
-
-  if (!bucket || bucket.resetAt <= now) {
-    rateLimitBuckets.set(key, {
-      count: 1,
-      resetAt: now + RATE_LIMIT_WINDOW_MS,
-    });
-
-    return false;
-  }
-
-  bucket.count += 1;
-  return bucket.count > RATE_LIMIT_MAX_REQUESTS;
-}
-
-function getClientIp(request: NextRequest) {
-  const forwardedFor = request.headers.get("x-forwarded-for");
-
-  if (forwardedFor) {
-    return forwardedFor.split(",")[0].trim();
-  }
-
-  return request.headers.get("x-real-ip") ?? "unknown";
-}
-
 function toHttpError(error: unknown) {
   if (error instanceof z.ZodError) {
     return { status: 400, message: "Invalid request body" };
@@ -1624,7 +1628,6 @@ function serializeError(error: unknown) {
 
   return { error };
 }
-
 ```
 ---
 
@@ -1660,7 +1663,9 @@ export async function GET(request: NextRequest) {
     );
 
     const redirectPath = getRedirectPath(result.paymentStatus);
-    return NextResponse.redirect(new URL(redirectPath, request.url));
+    const url = new URL(redirectPath, request.url);
+    url.searchParams.set("tran_id", tran_id);
+    return NextResponse.redirect(url);
   } catch (error) {
     log.error(
       { requestId, path, method, error: serializeError(error) },
@@ -1731,7 +1736,9 @@ export async function GET(request: NextRequest) {
     );
 
     const redirectPath = getRedirectPath(result.paymentStatus);
-    return NextResponse.redirect(new URL(redirectPath, request.url));
+    const url = new URL(redirectPath, request.url);
+    url.searchParams.set("tran_id", tran_id);
+    return NextResponse.redirect(url);
   } catch (error) {
     log.error(
       { requestId, path, method, error: serializeError(error) },
@@ -1800,7 +1807,9 @@ export async function GET(request: NextRequest) {
     );
 
     const redirectPath = getRedirectPath(result.paymentStatus);
-    return NextResponse.redirect(new URL(redirectPath, request.url));
+    const url = new URL(redirectPath, request.url);
+    url.searchParams.set("tran_id", tran_id);
+    return NextResponse.redirect(url);
   } catch (error) {
     log.error(
       { requestId, path, method, error: serializeError(error) },
