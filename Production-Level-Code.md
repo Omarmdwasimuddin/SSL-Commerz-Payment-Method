@@ -1999,6 +1999,36 @@ function serializeError(error: unknown) {
 ```
 ---
 
+#### app/checkout/success/page.tsx
+```bash
+
+```
+---
+
+#### app/checkout/fail/page.tsx
+```bash
+
+```
+---
+
+#### app/checkout/cancel/page.tsx
+```bash
+
+```
+---
+
+#### app/actions.ts
+```bash
+
+```
+---
+
+#### lib/rate-limit.ts
+```bash
+
+```
+---
+
 ####
 ```bash
 
