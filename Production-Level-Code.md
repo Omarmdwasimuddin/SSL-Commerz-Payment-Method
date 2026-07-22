@@ -2361,9 +2361,3 @@ export default function Home() {
 }
 ```
 ---
-
-####
-```bash
-
-```
----
