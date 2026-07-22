@@ -2319,6 +2319,49 @@ export function checkRateLimit(key: string): boolean {
 ```
 ---
 
+#### app/page.tsx
+```bash
+"use client";
+
+import { buyNowAction } from "./actions";
+
+export default function Home() {
+  return (
+    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
+      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
+        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left w-full">
+          <div className="max-w-md w-full border rounded-lg p-6 shadow-sm">
+            <div className="flex items-center gap-4">
+              <div className="w-16 h-16 bg-zinc-200 dark:bg-zinc-800 rounded-lg flex items-center justify-center text-2xl font-bold">
+                P
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold">Demo Product</h2>
+                <p className="text-sm text-zinc-500">BDT 10.00</p>
+              </div>
+            </div>
+            <button
+              onClick={async () => {
+                try {
+                  const result = await buyNowAction();
+                  window.location.href = result.gatewayUrl;
+                } catch {
+                  alert("Payment initiation failed. Please try again.");
+                }
+              }}
+              className="w-full mt-6 bg-black text-white rounded-full h-10 font-medium transition-colors hover:bg-zinc-800 dark:bg-white dark:text-black dark:hover:bg-zinc-200"
+            >
+              Buy Now
+            </button>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+```
+---
+
 ####
 ```bash
 
