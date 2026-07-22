@@ -2001,31 +2001,321 @@ function serializeError(error: unknown) {
 
 #### app/checkout/success/page.tsx
 ```bash
+import { PaymentStatus } from "@/app/generated/prisma";
+import { getPaymentWithOrder } from "@/services/payment.service";
 
+function getStatusLabel(status: PaymentStatus | undefined): string {
+  switch (status) {
+    case PaymentStatus.SUCCESS:
+      return "Success";
+    case PaymentStatus.FAILED:
+      return "Failed";
+    case PaymentStatus.CANCELLED:
+      return "Cancelled";
+    case PaymentStatus.PENDING:
+      return "Pending";
+    case PaymentStatus.INITIATED:
+      return "Initiated";
+    default:
+      return "Unknown";
+  }
+}
+
+export default async function CheckoutSuccessPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ tran_id?: string }>;
+}) {
+  const { tran_id } = await searchParams;
+  const data = tran_id ? await getPaymentWithOrder(tran_id) : null;
+  const paymentStatus = data?.payment.status;
+  const isSuccess = paymentStatus === PaymentStatus.SUCCESS;
+  const isMismatch = !isSuccess;
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-8">
+      <div className="max-w-md w-full border rounded-lg p-6 shadow-sm">
+        <h1 className="text-2xl font-bold mb-2">
+          {isMismatch ? "Payment Status Updated" : "Payment Success"}
+        </h1>
+
+        {isMismatch && (
+          <div className="mb-4 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded">
+            <p className="text-sm font-medium text-yellow-800 dark:text-yellow-200">
+              The URL shows success, but your actual payment status is:
+            </p>
+            <p className="text-lg font-bold mt-1">{getStatusLabel(paymentStatus)}</p>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          <div>
+            <p className="text-sm text-zinc-500">Product</p>
+            <p className="font-medium">{data?.productName ?? "Unknown"}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Amount</p>
+            <p className="font-medium">{data ? `${data.amount} ${data.currency}` : "—"}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Payment Status</p>
+            <p className="font-medium">{getStatusLabel(paymentStatus)}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Transaction ID</p>
+            <p className="font-mono text-sm break-all">{data?.tranId ?? "—"}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 ```
 ---
 
 #### app/checkout/fail/page.tsx
 ```bash
+import { PaymentStatus } from "@/app/generated/prisma";
+import { getPaymentWithOrder } from "@/services/payment.service";
 
+function getStatusLabel(status: PaymentStatus | undefined): string {
+  switch (status) {
+    case PaymentStatus.SUCCESS:
+      return "Success";
+    case PaymentStatus.FAILED:
+      return "Failed";
+    case PaymentStatus.CANCELLED:
+      return "Cancelled";
+    case PaymentStatus.PENDING:
+      return "Pending";
+    case PaymentStatus.INITIATED:
+      return "Initiated";
+    default:
+      return "Unknown";
+  }
+}
+
+export default async function CheckoutFailPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ tran_id?: string }>;
+}) {
+  const { tran_id } = await searchParams;
+  const data = tran_id ? await getPaymentWithOrder(tran_id) : null;
+  const paymentStatus = data?.payment.status;
+  const isFailed = paymentStatus === PaymentStatus.FAILED;
+  const isMismatch = !isFailed;
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-8">
+      <div className="max-w-md w-full border rounded-lg p-6 shadow-sm">
+        <h1 className="text-2xl font-bold mb-2">
+          {isMismatch ? "Payment Status Updated" : "Payment Failed"}
+        </h1>
+
+        {isMismatch && (
+          <div className="mb-4 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded">
+            <p className="text-sm font-medium text-yellow-800 dark:text-yellow-200">
+              The URL shows fail, but your actual payment status is:
+            </p>
+            <p className="text-lg font-bold mt-1">{getStatusLabel(paymentStatus)}</p>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          <div>
+            <p className="text-sm text-zinc-500">Product</p>
+            <p className="font-medium">{data?.productName ?? "Unknown"}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Amount</p>
+            <p className="font-medium">{data ? `${data.amount} ${data.currency}` : "—"}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Payment Status</p>
+            <p className="font-medium">{getStatusLabel(paymentStatus)}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Transaction ID</p>
+            <p className="font-mono text-sm break-all">{data?.tranId ?? "—"}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 ```
 ---
 
 #### app/checkout/cancel/page.tsx
 ```bash
+import { PaymentStatus } from "@/app/generated/prisma";
+import { getPaymentWithOrder } from "@/services/payment.service";
 
+function getStatusLabel(status: PaymentStatus | undefined): string {
+  switch (status) {
+    case PaymentStatus.SUCCESS:
+      return "Success";
+    case PaymentStatus.FAILED:
+      return "Failed";
+    case PaymentStatus.CANCELLED:
+      return "Cancelled";
+    case PaymentStatus.PENDING:
+      return "Pending";
+    case PaymentStatus.INITIATED:
+      return "Initiated";
+    default:
+      return "Unknown";
+  }
+}
+
+export default async function CheckoutCancelPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ tran_id?: string }>;
+}) {
+  const { tran_id } = await searchParams;
+  const data = tran_id ? await getPaymentWithOrder(tran_id) : null;
+  const paymentStatus = data?.payment.status;
+  const isCancelled = paymentStatus === PaymentStatus.CANCELLED;
+  const isMismatch = !isCancelled;
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-8">
+      <div className="max-w-md w-full border rounded-lg p-6 shadow-sm">
+        <h1 className="text-2xl font-bold mb-2">
+          {isMismatch ? "Payment Status Updated" : "Payment Cancelled"}
+        </h1>
+
+        {isMismatch && (
+          <div className="mb-4 p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded">
+            <p className="text-sm font-medium text-yellow-800 dark:text-yellow-200">
+              The URL shows cancel, but your actual payment status is:
+            </p>
+            <p className="text-lg font-bold mt-1">{getStatusLabel(paymentStatus)}</p>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          <div>
+            <p className="text-sm text-zinc-500">Product</p>
+            <p className="font-medium">{data?.productName ?? "Unknown"}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Amount</p>
+            <p className="font-medium">{data ? `${data.amount} ${data.currency}` : "—"}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Payment Status</p>
+            <p className="font-medium">{getStatusLabel(paymentStatus)}</p>
+          </div>
+          <div>
+            <p className="text-sm text-zinc-500">Transaction ID</p>
+            <p className="font-mono text-sm break-all">{data?.tranId ?? "—"}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 ```
 ---
 
 #### app/actions.ts
 ```bash
+"use server";
 
+import { headers } from "next/headers";
+import { checkRateLimit, getClientIp } from "@/lib/rate-limit";
+import { log } from "@/lib/logger";
+import { PaymentInitError } from "@/services/payment.service";
+import { createOrder } from "@/services/order.service";
+import { initiatePayment, type InitiatePaymentResult } from "@/services/payment.service";
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { error };
+}
+
+export async function buyNowAction(): Promise<InitiatePaymentResult> {
+  const requestId = crypto.randomUUID();
+
+  const requestHeaders = await headers();
+  const rateLimitKey = getClientIp(requestHeaders);
+
+  log.info({ requestId, rateLimitKey }, "Buy now action started");
+
+  if (checkRateLimit(rateLimitKey)) {
+    log.info({ requestId, rateLimitKey }, "Buy now rate limit exceeded");
+
+    throw new PaymentInitError("Too many payment initiation requests", 429);
+  }
+
+  const order = await createOrder({
+    productName: "Demo Product",
+    quantity: 1,
+    unitPrice: "10.00",
+  });
+
+  try {
+    const result = await initiatePayment(order.id);
+
+    log.info(
+      { requestId, orderId: order.id, tranId: result.tranId },
+      "Buy now action completed",
+    );
+
+    return result;
+  } catch (error) {
+    log.error(
+      { requestId, orderId: order.id, error: serializeError(error) },
+      "Buy now action failed",
+    );
+
+    throw error;
+  }
+}
 ```
 ---
 
 #### lib/rate-limit.ts
 ```bash
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 5;
+const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
 
+export function getClientIp(
+  headers: { get(name: string): string | null },
+): string {
+  const forwardedFor = headers.get("x-forwarded-for");
+  if (forwardedFor) {
+    return forwardedFor.split(",")[0].trim();
+  }
+  return headers.get("x-real-ip") ?? "unknown";
+}
+
+export function checkRateLimit(key: string): boolean {
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(key);
+
+  if (!bucket || bucket.resetAt <= now) {
+    rateLimitBuckets.set(key, {
+      count: 1,
+      resetAt: now + RATE_LIMIT_WINDOW_MS,
+    });
+
+    return false;
+  }
+
+  bucket.count += 1;
+  return bucket.count > RATE_LIMIT_MAX_REQUESTS;
+}
 ```
 ---
 
