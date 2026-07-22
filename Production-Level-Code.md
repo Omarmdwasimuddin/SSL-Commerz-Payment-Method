@@ -896,7 +896,7 @@ import { env } from "@/lib/env";
 import prisma from "@/lib/prisma";
 import { initSession, validateTransaction } from "@/lib/sslcommerz/client";
 import { getOrderWithTotal, markOrderPaid, markOrderFailed, markOrderCancelled } from "@/services/order.service";
-import { validationApiResponseSchema } from "@/validations/payment.schema";
+import { validationApiResponseSchema, ipnPayloadSchema } from "@/validations/payment.schema";
 import { log } from "@/lib/logger";
 
 export type InitiatePaymentResult = {
@@ -1050,6 +1050,12 @@ export type ProcessGatewayCallbackResult = {
   paymentStatus: PaymentStatus | "not_found";
 };
 
+const TERMINAL_PAYMENT_STATUSES: PaymentStatus[] = [
+  PaymentStatus.SUCCESS,
+  PaymentStatus.FAILED,
+  PaymentStatus.CANCELLED,
+];
+
 export async function processGatewayCallback(
   tranId: string,
   outcome: "success" | "fail" | "cancel",
@@ -1070,7 +1076,7 @@ export async function processGatewayCallback(
 
   const source = getWebhookSource(outcome);
 
-  if (payment.status === PaymentStatus.SUCCESS || payment.status === PaymentStatus.FAILED) {
+  if (TERMINAL_PAYMENT_STATUSES.includes(payment.status)) {
     await prisma.paymentEvent.create({
       data: {
         paymentId: payment.id,
@@ -1090,13 +1096,38 @@ export async function processGatewayCallback(
   }
 
   if (outcome === "cancel") {
-    await prisma.$transaction(async (tx) => {
-      await markOrderCancelled(payment.orderId, tx);
-      await tx.payment.update({
-        where: { id: payment.id },
+    const cancelResult = await prisma.$transaction(async (tx) => {
+      const updateResult = await tx.payment.updateMany({
+        where: { id: payment.id, status: { notIn: TERMINAL_PAYMENT_STATUSES } },
         data: { status: PaymentStatus.CANCELLED },
       });
+
+      if (updateResult.count === 0) {
+        return { raced: true };
+      }
+
+      await markOrderCancelled(payment.orderId, tx);
+      return { raced: false };
     });
+
+    if (cancelResult.raced) {
+      await prisma.paymentEvent.create({
+        data: {
+          paymentId: payment.id,
+          source: WebhookSource.REDIRECT_CANCEL,
+          requestId,
+          rawPayload: buildRawCallbackPayload(tranId, outcome, valId),
+          resultStatus: "duplicate_ignored",
+        },
+      });
+
+      log.info(
+        { requestId, paymentId: payment.id, tranId, status: payment.status },
+        "Duplicate gateway cancel ignored",
+      );
+
+      return { paymentStatus: payment.status };
+    }
 
     await prisma.paymentEvent.create({
       data: {
@@ -1116,68 +1147,11 @@ export async function processGatewayCallback(
     return { paymentStatus: PaymentStatus.CANCELLED };
   }
 
-  let validationResult: unknown = null;
-  let validationSucceeded = false;
-  let amountMatches = false;
-  let currencyMatches = false;
-
-  if (valId) {
-    try {
-      validationResult = await validateTransaction(valId);
-      const parsed = validationApiResponseSchema.safeParse(validationResult);
-
-      if (parsed.success) {
-        const data = parsed.data;
-        validationSucceeded = data.status === "VALID" || data.status === "VALIDATED";
-        amountMatches = new Prisma.Decimal(data.amount).equals(payment.amount);
-        currencyMatches = data.currency === payment.currency;
-      }
-    } catch (error) {
-      log.error(
-        { requestId, paymentId: payment.id, tranId, error: serializeError(error) },
-        "Validation API call failed",
-      );
-    }
-  }
-
-  const isSuccess = validationSucceeded && amountMatches && currencyMatches;
-
-  if (isSuccess) {
-    await prisma.$transaction(async (tx) => {
-      await tx.payment.update({
-        where: { id: payment.id },
-        data: { status: PaymentStatus.SUCCESS },
-      });
-      await markOrderPaid(payment.orderId, tx);
-    });
-
-    await prisma.paymentEvent.create({
-      data: {
-        paymentId: payment.id,
-        source,
-        requestId,
-        rawPayload: buildRawCallbackPayload(tranId, outcome, valId),
-        resultStatus: "validated_success",
-      },
-    });
-
-    return { paymentStatus: PaymentStatus.SUCCESS };
-  }
-
-  const failReason = !validationSucceeded
-    ? "validation_failed"
-    : "amount_mismatch";
-
-  await prisma.$transaction(async (tx) => {
-    await tx.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: PaymentStatus.FAILED,
-        failReason,
-      },
-    });
-    await markOrderFailed(payment.orderId, tx);
-  });
+  const { paymentStatus, failReason } = await applyValidationOutcome(
+    payment,
+    valId,
+    requestId,
+  );
 
   await prisma.paymentEvent.create({
     data: {
@@ -1189,7 +1163,112 @@ export async function processGatewayCallback(
     },
   });
 
-  return { paymentStatus: PaymentStatus.FAILED };
+  return { paymentStatus };
+}
+
+type ApplyValidationResult = {
+  paymentStatus: PaymentStatus;
+  failReason: string;
+};
+export type ProcessIpnResult = {
+  status: "success" | "fail";
+};
+
+export async function processIpn(
+  rawPayload: string,
+  requestId: string,
+): Promise<ProcessIpnResult> {
+  // PaymentEvent.paymentId is a required FK, so a payload that never
+  // resolves to a known Payment (bad tran_id, unparseable JSON) can only
+  // be logged via Pino here. The tran_id lookup therefore has to happen
+  // before any PaymentEvent write, not after.
+  let parsedPayload: Record<string, unknown>;
+  try {
+    parsedPayload = JSON.parse(rawPayload) as Record<string, unknown>;
+  } catch {
+    log.error(
+      { requestId, rawPayload },
+      "IPN payload is not valid JSON — cannot extract tran_id, skipping PaymentEvent creation",
+    );
+    return { status: "fail" };
+  }
+
+  // Step 2: Lightweight extraction of tran_id before any validation
+  const tranId = parsedPayload.tran_id;
+  if (typeof tranId !== "string" || !tranId) {
+    log.warn(
+      { requestId, tranId },
+      "IPN payload missing or invalid tran_id — cannot look up Payment",
+    );
+    return { status: "fail" };
+  }
+
+  // Step 3: Look up Payment by tran_id
+  const payment = await prisma.payment.findUnique({
+    where: { tranId },
+  });
+
+  if (!payment) {
+    log.warn(
+      { requestId, tranId },
+      "IPN received for unknown tran_id — cannot create PaymentEvent (FK constraint)",
+    );
+    return { status: "fail" };
+  }
+
+  // Step 4: Persist raw payload to PaymentEvent NOW (before schema validation)
+  const paymentEvent = await prisma.paymentEvent.create({
+    data: {
+      paymentId: payment.id,
+      source: WebhookSource.IPN,
+      requestId,
+      rawPayload: JSON.parse(JSON.stringify(parsedPayload)) as Prisma.InputJsonValue,
+    },
+  });
+
+  // Step 5: Validate payload shape with ipnPayloadSchema
+  const payloadValidation = ipnPayloadSchema.safeParse(parsedPayload);
+  if (!payloadValidation.success) {
+    await prisma.paymentEvent.update({
+      where: { id: paymentEvent.id },
+      data: { resultStatus: "invalid_payload", processedAt: new Date() },
+    });
+    log.warn(
+      { requestId, paymentId: payment.id, tranId, issues: payloadValidation.error.issues },
+      "IPN payload failed schema validation",
+    );
+    return { status: "fail" };
+  }
+
+  const ipnPayload = payloadValidation.data;
+
+  // Step 6: If Payment status is already terminal, mark as duplicate and return
+  if (TERMINAL_PAYMENT_STATUSES.includes(payment.status)) {
+    await prisma.paymentEvent.update({
+      where: { id: paymentEvent.id },
+      data: { resultStatus: "duplicate_ignored", processedAt: new Date() },
+    });
+    log.info(
+      { requestId, paymentId: payment.id, tranId, status: payment.status },
+      "Duplicate IPN ignored — Payment already terminal",
+    );
+    return { status: "fail" };
+  }
+
+  // Step 7: Validate via Validation API and apply outcome
+  const { paymentStatus, failReason } = await applyValidationOutcome(
+    payment,
+    ipnPayload.val_id,
+    requestId,
+  );
+
+  // Step 8: Update PaymentEvent with final result
+  await prisma.paymentEvent.update({
+    where: { id: paymentEvent.id },
+    data: { resultStatus: failReason, processedAt: new Date() },
+  });
+
+  return { status: paymentStatus === PaymentStatus.SUCCESS ? "success" : "fail" };
 }
 
 function getWebhookSource(
@@ -1222,6 +1301,76 @@ function buildRawCallbackPayload(
   return JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue;
 }
 
+async function applyValidationOutcome(
+  payment: { id: string; orderId: string; amount: Prisma.Decimal; currency: string; status: PaymentStatus },
+  valId: string | undefined,
+  requestId: string,
+): Promise<ApplyValidationResult> {
+  const terminalStatuses = TERMINAL_PAYMENT_STATUSES;
+
+  const performAtomicUpdate = async (
+    status: PaymentStatus,
+    failReason: string,
+  ): Promise<ApplyValidationResult> => {
+    // Atomic update with race guard inside transaction
+    const result = await prisma.$transaction(async (tx) => {
+      const updateResult = await tx.payment.updateMany({
+        where: { id: payment.id, status: { notIn: terminalStatuses } },
+        data: { status, failReason },
+      });
+
+      if (updateResult.count === 0) {
+        return { raced: true };
+      }
+
+      if (status === PaymentStatus.SUCCESS) {
+        await markOrderPaid(payment.orderId, tx);
+      } else {
+        await markOrderFailed(payment.orderId, tx);
+      }
+
+      return { raced: false };
+    });
+
+    if (result.raced) {
+      return { paymentStatus: status, failReason: "duplicate_ignored" };
+    }
+
+    return { paymentStatus: status, failReason };
+  };
+
+  if (!valId) {
+    return performAtomicUpdate(PaymentStatus.FAILED, "validation_failed");
+  }
+
+  let validationResult: unknown = null;
+  try {
+    validationResult = await validateTransaction(valId);
+  } catch (error) {
+    log.error(
+      { requestId, paymentId: payment.id, error: serializeError(error) },
+      "Validation API call failed",
+    );
+  }
+
+  const parsed = validationApiResponseSchema.safeParse(validationResult);
+  if (!parsed.success) {
+    return performAtomicUpdate(PaymentStatus.FAILED, "validation_failed");
+  }
+
+  const data = parsed.data;
+  const isValid = data.status === "VALID" || data.status === "VALIDATED";
+  const amountMatches = new Prisma.Decimal(data.amount).equals(payment.amount);
+  const currencyMatches = data.currency === payment.currency;
+
+  if (isValid && amountMatches && currencyMatches) {
+    return performAtomicUpdate(PaymentStatus.SUCCESS, "validated_success");
+  }
+
+  const failReason = !isValid ? "validation_failed" : "amount_mismatch";
+  return performAtomicUpdate(PaymentStatus.FAILED, failReason);
+}
+
 function serializeError(error: unknown) {
   if (error instanceof Error) {
     return {
@@ -1233,59 +1382,52 @@ function serializeError(error: unknown) {
   return { error };
 }
 
-function buildCallbackUrls() {
-  const appUrl = env.APP_URL.replace(/\/$/, "");
-
-  return {
-    successUrl: `${appUrl}/api/payment/success`,
-    failUrl: `${appUrl}/api/payment/fail`,
-    cancelUrl: `${appUrl}/api/payment/cancel`,
-    ipnUrl: `${appUrl}/api/payment/ipn`,
-  };
-}
-
-function buildProductSnapshot(
-  items: Array<{ productName: string; quantity: number }>,
-) {
-  const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
-
-  return {
-    name:
-      items.length === 1
-        ? items[0].productName
-        : `${items.length} order items`,
-    quantity: totalQuantity,
-  };
-}
-
 async function cacheIdempotentResponse(
-  idempotencyKey: string,
+  key: string,
   orderId: string,
   response: InitiatePaymentResult,
 ) {
   await prisma.idempotencyKey.upsert({
-    where: { key: idempotencyKey },
+    where: { key },
     create: {
-      key: idempotencyKey,
+      key,
       orderId,
-      responseBody: response,
+      responseBody: response as Prisma.InputJsonValue,
     },
     update: {
-      orderId,
-      responseBody: response,
+      responseBody: response as Prisma.InputJsonValue,
     },
   });
 }
 
-function isUniqueConstraintError(error: unknown) {
-  return (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === "P2002"
-  );
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 }
 
-function toPrismaJson(value: unknown): Prisma.InputJsonValue {
-  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+function buildCallbackUrls() {
+  return {
+    successUrl: new URL("/api/payment/success", env.APP_URL).toString(),
+    failUrl: new URL("/api/payment/fail", env.APP_URL).toString(),
+    cancelUrl: new URL("/api/payment/cancel", env.APP_URL).toString(),
+    ipnUrl: new URL("/api/payment/ipn", env.APP_URL).toString(),
+  };
+}
+
+function buildProductSnapshot(
+  items: { productName: string; quantity: number }[],
+) {
+  const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
+  const name = items[0]?.productName ?? "Demo Product";
+  return {
+    name,
+    category: "General",
+    profile: "general",
+    quantity: totalQuantity,
+  };
+}
+
+function toPrismaJson<T>(value: T): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value));
 }
 ```
 ---
